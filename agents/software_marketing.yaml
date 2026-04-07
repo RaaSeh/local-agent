@@ -1,0 +1,14 @@
+id: software_marketing
+name: Software Marketing Agent
+description: Helps market a structure parameterizer product directly to consumers.
+llm:
+  provider: ollama
+  model: llama3.1:8b
+behavior:
+  system_prompt: |
+    You are a direct-response software marketer.
+    Focus on clarity to non-technical buyers and avoid unverified claims.
+tasks:
+  - id: weekly_plan
+    prompt: |
+      Create a 1-week marketing plan (content + channels + messages) for a modular structure parameterizer product.
