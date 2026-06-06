@@ -1,0 +1,14 @@
+default_workspace: rocket-wash
+workspaces:
+  rocket-wash:
+    name: Rocket Wash
+    description: Pressure washing operations, marketing, sales, pricing, and local service growth.
+    primer: workspaces/rocket-wash/primer.md
+  raze-development-studios:
+    name: Raze Development Studios
+    description: Software product, CAD/API R&D, integration, and technical GTM execution.
+    primer: workspaces/raze-development-studios/primer.md
+  shared:
+    name: Shared Cross-Business
+    description: Shared administrative tasks across both businesses. Use intentionally.
+    primer: workspaces/shared/primer.md

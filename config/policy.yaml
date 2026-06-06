@@ -1,0 +1,8 @@
+approval:
+  require_for_tool_names:
+    []
+  require_for_categories:
+    - external_action
+    - destructive_action
+    - production_change
+    - spend_money

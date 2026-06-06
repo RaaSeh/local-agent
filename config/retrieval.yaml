@@ -1,0 +1,19 @@
+enabled: true
+default_citations: true
+include_paths:
+  - README.md
+  - SPECIFICATION.md
+  - prompts
+  - src
+  - agents
+  - workspaces
+  - runs
+include_extensions:
+  - .md
+  - .txt
+  - .yaml
+  - .yml
+  - .toml
+  - .json
+  - .py
+max_file_chars: 12000

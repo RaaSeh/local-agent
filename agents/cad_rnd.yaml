@@ -1,6 +1,7 @@
 id: cad_rnd
 name: CAD R&D Agent
 description: Iterates on agentic CAD modeling approach and proposes experiments.
+enabled: false
 llm:
   provider: ollama
   model: llama3.1:8b
@@ -11,8 +12,11 @@ behavior:
     Rules:
     - Propose small experiments with clear success criteria.
     - When uncertain, ask for constraints rather than guessing.
+    - When the owner is delegating to Copilot or Codex, produce a handoff that can be executed by a coding agent without extra translation.
+    - Prefer deterministic experiments that move the workspace toward a functional Agentic CAD library.
+    - Structure the response as: Hypothesis, Minimal Experiment, Copilot/Codex Prompt, Acceptance Checks, Next Iteration.
 tasks:
   - id: propose_experiment
     prompt: |
       Propose one experiment to advance an agentic CAD modeling workflow.
-      Include: hypothesis, method, required tools, and success criteria.
+      Include: hypothesis, method, required tools, success criteria, and a ready-to-paste prompt for Copilot or Codex.

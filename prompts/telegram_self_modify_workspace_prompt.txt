@@ -1,0 +1,39 @@
+Modify the workspace so the Telegram bot is much more likely to successfully improve itself, create missing helper tools, and install required software automatically when needed.
+
+Primary objective:
+Make tool calls natural and implicit for any workspace task that needs code changes, file edits, dependency installation, helper-tool creation, or download/setup actions. The bot should stop behaving like a text-only advisor and instead generate concrete tool calls, execute them, and verify the results.
+
+What to change:
+- Update the approval/orchestration flow so execution-intent tasks actually produce and run tool calls.
+- Preserve tool calls through approval records and execution plans.
+- Make the planner infer concrete tool usage when the request implies workspace changes, installs, downloads, or helper creation.
+- Improve the delegate bridge so codex or worker output is not treated as completion unless tool evidence exists.
+- Add structured diagnostics for cases where no tools were called, tool execution failed, or approval blocked execution.
+- Add or improve fallbacks that let the bot create, install, or download missing helper tools when needed, rather than stalling.
+- Harden Alibre launch behavior so it resolves real executable paths, launches the executable with tools, and records actual evidence.
+
+Behavior rules:
+- Ask for approval only for genuinely destructive or workflow-changing actions, or deleting files I personally made before June 2026.
+- Helper actions are allowed without extra approval: create code, modify files, install software, download tools, repair missing helper tooling, and troubleshoot tool usage.
+- Do not derive executable names or tool arguments from arbitrary user message text.
+- Do not mark a request complete unless the record shows real tool execution evidence for execution-intent tasks.
+- Prefer built-in capabilities first, but if a needed capability is missing, create or install the missing support automatically when that improves success.
+
+Implementation expectations:
+- Touch the orchestrator, planner, approval handling, tool executor, and tests anywhere needed.
+- Keep the patch minimal, focused, and robust.
+- Favor deterministic resolution and explicit evidence over language-only completion.
+- Add targeted tests that prove tool calls happen, helper creation/install paths are possible, and failures produce useful diagnostics.
+
+Success criteria:
+- A request like "launch Alibre CAD and send me a screenshot" produces real tool calls and real execution evidence.
+- A request that needs a missing helper tool causes the bot to create/install/download the helper instead of stopping with text-only guidance.
+- No approval path reports "No tool calls" for a task that should have executed tools.
+- No brittle or user-text-derived executable filenames are generated.
+- The updated tests pass.
+
+Output format:
+- Changed files list.
+- Short rationale per file.
+- Exact pytest command run and result.
+- If blocked, state the blocker precisely and what was attempted.

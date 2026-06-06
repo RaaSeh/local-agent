@@ -1,0 +1,90 @@
+{
+  "lessons": [
+    {
+      "value": "The winner of the lead generation evaluation was Mistral with a score of 8.6/10.",
+      "source": "Evaluation Results",
+      "recorded_at": "2026-04-14T16:50:15.067054+00:00"
+    },
+    {
+      "value": "# SUPERVISOR REVIEW\n\n## 1) Summary\n\n**REJECT THIS OUTPUT.**\n\nThe worker agent completely failed the assignment. Instead of generating **actual leads** for pressure washing or Raze Development Studios, it produced meta-commentary about experiment design and YAML configuration files. This is a **criti",
+      "source": "supervisor",
+      "recorded_at": "2026-04-14T17:10:22.514356+00:00"
+    },
+    {
+      "value": "The winner of the lead generation evaluation was Mistral with a score of 8.6/10. (Evaluation Results)",
+      "source": "Owner Memory",
+      "recorded_at": "2026-04-14T18:29:11.093638+00:00"
+    },
+    {
+      "value": "# SUPERVISOR REVIEW\n\n## 1) Summary\n\n**This worker output is a complete failure.** The software dev agent produced zero leads, zero research, and zero actionable work. Instead, it delivered meta-commentary requesting further instruction\u2014a fundamental misunderstanding of its role. This represents a pr",
+      "source": "supervisor",
+      "recorded_at": "2026-04-14T19:24:17.679226+00:00"
+    },
+    {
+      "value": "```json\n{\n  \"summary\": \"REJECT THIS OUTPUT. The delegate agent has completely misunderstood the assignment. The owner requested API wrappers for Alibre CAD software with reference to existing AgenticCAD library work, but the agent produced a generic research hypothesis and experimental design framew",
+      "source": "supervisor",
+      "recorded_at": "2026-05-26T00:38:33.673398+00:00"
+    },
+    {
+      "value": "```json\n{\n  \"summary\": \"REJECT THIS OUTPUT. Critical process failure across the entire chain. The owner requested CAD software implementation work (Alibre mate wrappers), but the planner selected 'delegated_work' without executing any tools, and the delegate produced pseudo-code fantasy instead of e",
+      "source": "supervisor",
+      "recorded_at": "2026-05-26T01:04:43.731753+00:00"
+    },
+    {
+      "value": "```json\n{\n  \"summary\": \"COMPLETE SYSTEM FAILURE. This output represents a catastrophic disconnect from business reality. The owner sent 'test status' - likely checking system health - but received hallucinated CAD software implementation work that has zero connection to either active business (Rocke",
+      "source": "supervisor",
+      "recorded_at": "2026-05-31T03:57:29.735894+00:00"
+    },
+    {
+      "value": "```json\n{\n  \"summary\": \"REJECT THIS OUTPUT. Complete failure on all fronts. Owner requested 'Open Alibre' - a simple CAD software operation. The planner selected 'delegated_work' but executed NO tools. The delegate produced a pseudo-code fantasy script with a hardcoded Windows path (C:\\\\Program File",
+      "source": "supervisor",
+      "recorded_at": "2026-05-31T04:06:05.514833+00:00"
+    },
+    {
+      "value": "```json\n{\n  \"summary\": \"REJECT THIS OUTPUT - CATASTROPHIC PROCESS FAILURE. The owner requested 'review the previous task and update according to the errors until you can open the Alibre CAD software.' This is a CAD R&D task requiring actual tool execution. Instead: (1) Planner selected 'delegated_wo",
+      "source": "supervisor",
+      "recorded_at": "2026-05-31T04:21:18.285994+00:00"
+    },
+    {
+      "value": "```json\n{\n  \"summary\": \"REJECT THIS OUTPUT - COMPLETE PROCESS FAILURE. Owner requested a simple desktop action: open Alibre CAD and provide a screenshot. This is a straightforward computer_use task requiring: (1) tool execution to open the software, (2) screenshot capture, (3) verification. Instead:",
+      "source": "supervisor",
+      "recorded_at": "2026-06-02T21:36:46.178178+00:00"
+    },
+    {
+      "value": "```json\n{\n  \"summary\": \"REJECT THIS OUTPUT - COMPLETE PROCESS FAILURE. Owner requested a simple desktop action: open Alibre CAD software and provide a screenshot. This is a straightforward computer_use task requiring: (1) tool execution to locate/launch the software, (2) screenshot capture, (3) veri",
+      "source": "supervisor",
+      "recorded_at": "2026-06-02T22:56:38.105317+00:00"
+    },
+    {
+      "value": "```json\n{\n  \"summary\": \"REJECT THIS OUTPUT - CATASTROPHIC PROCESS FAILURE. Owner requested a simple desktop action: open Alibre CAD and provide a screenshot. This is a straightforward computer_use task requiring: (1) tool execution to locate/launch the software, (2) screenshot capture, (3) verificat",
+      "source": "supervisor",
+      "recorded_at": "2026-06-02T22:57:41.694934+00:00"
+    },
+    {
+      "value": "```json\n{\n  \"summary\": \"REJECT THIS OUTPUT - COMPLETE PROCESS FAILURE. Owner requested 'be sure to save the alibre executable location for future calls' - a simple state management task. The planner correctly selected 'delegated_work' but executed NO tools. The delegate produced fantasy Python code",
+      "source": "supervisor",
+      "recorded_at": "2026-06-02T23:56:11.600305+00:00"
+    },
+    {
+      "value": "```json\n{\n  \"summary\": \"REJECT THIS OUTPUT - COMPLETE PROCESS FAILURE. Owner provided detailed diagnostic context pointing to specific code-path issues in interactions.jsonl, admin.py, tools.py, and planner.py, with line numbers. This is an EXECUTION task requiring: (1) actual code changes to remove",
+      "source": "supervisor",
+      "recorded_at": "2026-06-03T20:03:42.070546+00:00"
+    },
+    {
+      "value": "```json\n{\n  \"summary\": \"REJECT THIS OUTPUT - COMPLETE PROCESS FAILURE. Owner provided detailed diagnostic context with specific file paths, line numbers, and code-path issues requiring actual code modifications. This is an EXECUTION task requiring: (1) actual file edits to admin.py, tools.py, planne",
+      "source": "supervisor",
+      "recorded_at": "2026-06-03T20:15:40.967126+00:00"
+    },
+    {
+      "value": "```json\n{\n  \"summary\": \"REJECT THIS OUTPUT - COMPLETE PROCESS FAILURE. Owner provided detailed diagnostic context with specific file paths, line numbers, and code-path issues requiring actual code modifications to admin.py, tools.py, and planner.py. The planner correctly selected 'delegated_work' bu",
+      "source": "supervisor",
+      "recorded_at": "2026-06-03T20:45:17.949370+00:00"
+    },
+    {
+      "value": "```json\n{\n  \"summary\": \"REJECT THIS OUTPUT - COMPLETE PROCESS FAILURE. Owner provided detailed diagnostic context with specific file paths, line numbers, and code-path issues requiring actual code modifications. This is an EXECUTION task requiring: (1) actual file edits to admin.py, tools.py, and pl",
+      "source": "supervisor",
+      "recorded_at": "2026-06-03T21:50:39.685492+00:00"
+    }
+  ],
+  "updated_at": "2026-06-03T21:50:39.685492+00:00"
+}

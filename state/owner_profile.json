@@ -1,0 +1,21 @@
+{
+  "identity": [
+    "Owner-operator based in Ladysmith BC, Canada",
+    "Works on the tools day-to-day for Rocket Wash"
+  ],
+  "businesses": [
+    "Rocket Wash: pressure washing business. Services: pressure washing, window washing, gutter cleaning, moss removal, roof cleaning, soft washing. Service area: Ladysmith-Nanaimo-Mill Bay corridor plus Chemainus, Duncan, North Cowichan, Crofton, Maple Bay, Lake Cowichan, Shawnigan Lake, Genoa Bay, Youbou, Westhome, Parksville. Website: rocketwashbc.com. Focus: small-to-midsize B2B only (strata, property management, industrial yards, marinas). Avoid large institutions and hospitals.",
+    "Raze Development Studios: React-based product configurator software for highly-parameterized industrial/commercial products (steel-frame PVC-cover shelters). Website going live soon. No current sales process. Sells globally - not geographically restricted."
+  ],
+  "preferences": [
+    "Rocket Wash leads must be real and verifiable (working website and phone), small-to-midsize B2B, no residential, no large institutions",
+    "software_dev agent: build tools only, never generate leads",
+    "cad_rnd agent: R&D product experiments only, never generate leads",
+    "Communication: concise phone-friendly Telegram summaries"
+  ],
+  "active_projects": [
+    "Rocket Wash: daily B2B lead generation via pwasher_marketing agent",
+    "Raze Development Studios: build outreach and marketing pipeline via software_marketing agent"
+  ],
+  "updated_at": "2026-04-14T20:00:00+00:00"
+}

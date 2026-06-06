@@ -5,14 +5,17 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "local-agent"
 version = "0.1.0"
-description = "Minimal local agent scaffold (Ollama workers + Claude supervisor) with cron-style entrypoint."
+description = "Windows-first AI operations orchestration platform with hosted/local model routing, approvals, retrieval, and Telegram remote control."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+  "fastapi>=0.115",
   "httpx>=0.27",
+  "ollama>=0.3",
   "pyyaml>=6.0",
   "python-dotenv>=1.0",
   "rich>=13.0",
+  "uvicorn>=0.30",
 ]
 
 [project.optional-dependencies]

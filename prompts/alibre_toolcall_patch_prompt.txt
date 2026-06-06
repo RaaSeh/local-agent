@@ -1,0 +1,43 @@
+Implement a patch that makes the Telegram bot reliably emit and execute real tool calls for workspace work, while keeping approvals only for genuinely destructive or workflow-changing actions.
+
+Goal:
+Make tool use natural and implicit. If a request needs code changes, file edits, dependency installation, downloads, helper tool creation, or workspace setup, the bot should generate concrete tool calls and carry them out instead of replying with text-only guidance.
+
+Policy constraints:
+- Ask for approval only when the action would change my workflows, delete files I personally made before June 2026, or perform another genuinely destructive operation.
+- Helper actions are allowed without extra approval: create code, modify files, install or download software, create missing tools, repair broken tool paths, and troubleshoot tool use.
+- Prefer built-in tools first, but if a needed tool is missing, the bot should be allowed to create it, install it, or download it automatically when that improves success.
+- Do not convert arbitrary user message text into executable names or tool arguments.
+- Do not complete execution-intent tasks from language-only evidence. Require actual tool execution evidence.
+
+Task scope:
+- Update the orchestrator, planner, approval handling, delegate bridge, and tool execution flow anywhere needed to make tool calls actually happen.
+- Improve the Alibre launch patch flow so a prompt like "launch Alibre CAD and send me a screenshot" resolves a real executable path, launches it with tool calls, and records real execution evidence.
+- If the bot is missing a helper capability or tool, make it create, install, or download the needed support naturally and implicitly.
+- Add or update tests to prove the behavior.
+
+Required behavior changes:
+1. Execution-intent tasks must produce concrete tool calls, not just a completed text summary.
+2. Approval records must preserve tool calls and execute them on approval.
+3. The bot must distinguish between code/support tasks and real execution tasks.
+4. The bot must surface structured diagnostics when execution fails:
+   - whether tool calls were generated
+   - whether the plan was blocked by approval
+   - whether execution ran but produced no evidence
+   - which tool names were executed
+   - which fallback path was used
+5. For Alibre specifically, resolve the real executable path deterministically and launch that path, with bounded fallback behavior if the first launch method fails.
+
+Acceptance criteria:
+- A request to launch Alibre produces a plan with real tool calls and execution evidence.
+- The bot can create or install missing helper tools when needed instead of stalling.
+- No approval path completes with "No tool calls" for a task that should have executed tools.
+- No brittle or user-text-derived executable names are generated.
+- Tests pass for the new behavior.
+
+Output requirements:
+- Return the changed files list.
+- Give a short rationale per file.
+- Include the exact pytest command you ran and the result.
+- If blocked, say exactly what is missing and what was attempted.
+- Keep the patch minimal, focused, and defensible.

@@ -1,0 +1,6 @@
+{
+  "ok": true,
+  "worker_path": "runs\\trade_marketing-20260411-124442.json",
+  "supervisor_path": "runs\\supervisor-20260411-124506.json",
+  "digest_path": "runs\\digests\\2026-04-11.md"
+}

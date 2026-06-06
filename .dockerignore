@@ -1,0 +1,10 @@
+.git
+.venv
+.vscode
+runs
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.env
+.tmp*

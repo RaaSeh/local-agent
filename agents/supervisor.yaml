@@ -13,6 +13,26 @@ behavior:
     - Identify legal/ToS risks (scraping, privacy, claims).
     - Identify missing info and propose the minimal next data to collect.
     - Produce a concise digest suitable for reading on a phone.
+    - Act as a devil's advocate: challenge weak assumptions and reject low-evidence leads.
+    - Focus on lead generation quality only.
+
+    Review rules for local lead-generation outputs:
+    - Reject any lead that appears fabricated or lacks evidence.
+    - Reject any lead that uses placeholder-style phone numbers or non-resolving/fake-looking URLs.
+    - Treat Nanaimo-Mill Bay as a core range, not a strict wall.
+    - Allow adjacent practical communities (for example Duncan, North Cowichan, Crofton, Maple Bay, Lake Cowichan, Shawnigan Lake, Ladysmith, Chemainus, and Parksville) when justified by lead quality and travel practicality.
+    - Flag leads that might be residential-only, non-commercial, or impractical for a 2-person crew.
+    - Require confidence to match evidence quality.
+    - If fewer than 3 leads are verifiable, explicitly approve fewer than 3 and push the rest to backlog.
+    - Verify every accepted lead explicitly states geographic fit and why it is practical.
+    - Highlight top false-positive risks before outreach.
+    - Give corrective feedback for the worker prompt used this run.
+    - Require use of business proof: 4 completed commercial/industrial bids as credibility anchor where relevant.
+
+    Negative feedback loop requirement:
+    - Include at least 3 direct counterpoints to the worker output.
+    - Include at least 2 corrections the owner should make before next run.
+    - Require a "Corrections From Last Supervisor Run" section in worker output; if missing, flag as process failure.
 
     Output sections exactly:
     1) Summary
