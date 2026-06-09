@@ -9,6 +9,8 @@ import time
 import urllib.request
 from pathlib import Path
 
+from local_agent.tools.wix import WixClient, audit_blog_posts
+
 
 class ToolExecutor:
     def __init__(self, workspace_root: str | Path = "."):
@@ -369,6 +371,47 @@ class ToolExecutor:
         urllib.request.urlretrieve(url, dest)  # noqa: S310 — HTTPS-only guard above
         size = dest.stat().st_size
         return f"Downloaded {url} → {dest} ({size} bytes)"
+
+    def _wix_client(self) -> WixClient:
+        """Build a Wix client from the repo's standard env-based config."""
+        return WixClient.from_env()
+
+    @staticmethod
+    def _coerce_mapping(value, field: str) -> dict:
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str) and value.strip():
+            parsed = json.loads(value)
+            if not isinstance(parsed, dict):
+                raise ValueError(f"{field} must be a JSON object")
+            return parsed
+        raise ValueError(f"{field} requires a JSON object")
+
+    def _tool_wix_seo_audit(self, call: dict) -> str:
+        """Read-only SEO audit of Wix blog content. Never mutates the site."""
+        limit = int(call.get("limit", 50))
+        client = self._wix_client()
+        posts = client.list_blog_posts(limit=limit)
+        report = audit_blog_posts(posts)
+        payload = {"report": report.to_dict(), "summary": report.summary()}
+        return json.dumps(payload)
+
+    def _tool_wix_create_draft_post(self, call: dict) -> str:
+        """Create a Wix blog DRAFT post. Drafts are never published by Chad."""
+        draft_post = self._coerce_mapping(call.get("draft_post"), "draft_post")
+        client = self._wix_client()
+        result = client.create_draft_post(draft_post)
+        return json.dumps(result)
+
+    def _tool_wix_update_draft_post(self, call: dict) -> str:
+        """Update an existing Wix blog DRAFT post. Stays a draft; never published."""
+        draft_post_id = str(call.get("draft_post_id") or call.get("id") or "").strip()
+        if not draft_post_id:
+            raise ValueError("wix_update_draft_post requires draft_post_id")
+        draft_post = self._coerce_mapping(call.get("draft_post"), "draft_post")
+        client = self._wix_client()
+        result = client.update_draft_post(draft_post_id, draft_post)
+        return json.dumps(result)
 
     def _tool_run_command(self, call: dict) -> str:
         command = str(call.get("command", "")).strip()
