@@ -370,6 +370,64 @@ class ToolExecutor:
         size = dest.stat().st_size
         return f"Downloaded {url} → {dest} ({size} bytes)"
 
+    # --- Sanity multi-tenant CMS tools (Phase 1, draft-only) ---------------
+    # These delegate to local_agent.integrations.sanity. Every write creates or
+    # updates a Sanity DRAFT (drafts.* _id) only; publishing is a human action in
+    # Sanity Studio. No publish/promote handler exists by design.
+
+    def _tool_provision_tenant(self, call: dict) -> str:
+        from local_agent.integrations.sanity import tools as sanity_tools
+
+        result = sanity_tools.provision_tenant(
+            name=str(call.get("name", "")),
+            subdomain_slug=str(call.get("subdomain_slug", "")),
+            brand=call.get("brand") if isinstance(call.get("brand"), dict) else None,
+        )
+        return json.dumps(result)
+
+    def _tool_draft_tenant_page(self, call: dict) -> str:
+        from local_agent.integrations.sanity import tools as sanity_tools
+
+        result = sanity_tools.draft_tenant_page(
+            tenant_ref=str(call.get("tenant_ref", "")),
+            title=str(call.get("title", "")),
+            body=str(call.get("body", "")),
+            seo_title=call.get("seo_title"),
+            seo_description=call.get("seo_description"),
+            slug=call.get("slug"),
+            structured_data=call.get("structured_data")
+            if isinstance(call.get("structured_data"), dict)
+            else None,
+        )
+        return json.dumps(result)
+
+    def _tool_update_tenant_page(self, call: dict) -> str:
+        from local_agent.integrations.sanity import tools as sanity_tools
+
+        fields = call.get("fields")
+        if not isinstance(fields, dict):
+            raise ValueError("update_tenant_page requires a 'fields' object")
+        result = sanity_tools.update_tenant_page(
+            draft_page_id=str(call.get("draft_page_id", "")),
+            fields=fields,
+        )
+        return json.dumps(result)
+
+    def _tool_list_tenants(self, call: dict) -> str:
+        from local_agent.integrations.sanity import tools as sanity_tools
+
+        return json.dumps(sanity_tools.list_tenants())
+
+    def _tool_list_tenant_pages(self, call: dict) -> str:
+        from local_agent.integrations.sanity import tools as sanity_tools
+
+        return json.dumps(sanity_tools.list_tenant_pages(str(call.get("tenant_ref", ""))))
+
+    def _tool_seo_audit_tenant(self, call: dict) -> str:
+        from local_agent.integrations.sanity import tools as sanity_tools
+
+        return json.dumps(sanity_tools.seo_audit_tenant(str(call.get("tenant_ref", ""))))
+
     def _tool_run_command(self, call: dict) -> str:
         command = str(call.get("command", "")).strip()
         if not command:
