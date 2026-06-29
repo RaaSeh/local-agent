@@ -14,6 +14,18 @@ class ToolExecutor:
     def __init__(self, workspace_root: str | Path = "."):
         self.workspace_root = Path(workspace_root).resolve()
 
+    @staticmethod
+    def _safe_int(raw_value, default: int, minimum: int | None = None, maximum: int | None = None) -> int:
+        try:
+            value = int(raw_value)
+        except (TypeError, ValueError):
+            value = int(default)
+        if minimum is not None and value < minimum:
+            value = minimum
+        if maximum is not None and value > maximum:
+            value = maximum
+        return value
+
     def execute(self, tool_calls: list[dict] | None) -> list[dict]:
         results: list[dict] = []
         for call in (tool_calls or [])[:5]:
@@ -72,7 +84,8 @@ class ToolExecutor:
         if not root.exists():
             raise FileNotFoundError(f"Path not found: {root}")
         entries = sorted(root.iterdir(), key=lambda item: (item.is_file(), item.name.lower()))
-        limited = entries[: int(call.get("limit", 40))]
+        limit = self._safe_int(call.get("limit", 40), default=40, minimum=1, maximum=500)
+        limited = entries[:limit]
         lines = []
         for entry in limited:
             suffix = "/" if entry.is_dir() else ""
@@ -81,8 +94,8 @@ class ToolExecutor:
 
     def _tool_read_file(self, call: dict) -> str:
         path = self._resolve_path(call.get("path"))
-        start = max(int(call.get("start_line", 1)), 1)
-        end = max(int(call.get("end_line", start + 50)), start)
+        start = self._safe_int(call.get("start_line", 1), default=1, minimum=1)
+        end = self._safe_int(call.get("end_line", start + 50), default=start + 50, minimum=start)
         lines = path.read_text(encoding="utf-8").splitlines()
         excerpt = lines[start - 1 : end]
         return "\n".join(excerpt)
@@ -254,6 +267,7 @@ class ToolExecutor:
             raise ValueError("search_text requires query")
         if not root.exists():
             raise FileNotFoundError(f"Path not found: {root}")
+        limit = self._safe_int(call.get("limit", 20), default=20, minimum=1, maximum=500)
         matches: list[str] = []
 
         candidate_paths: list[Path] = []
@@ -272,7 +286,7 @@ class ToolExecutor:
             for idx, line in enumerate(lines, start=1):
                 if query in line.lower():
                     matches.append(f"{path}:{idx}: {line.strip()}")
-                    if len(matches) >= int(call.get("limit", 20)):
+                    if len(matches) >= limit:
                         return "\n".join(matches)
         return "\n".join(matches) or "No matches"
 

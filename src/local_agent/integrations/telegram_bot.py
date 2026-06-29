@@ -183,6 +183,7 @@ def _build_runner() -> OrchestratorRunner:
 
 def _build_admin_orchestrator() -> AdminOrchestrator:
     load_env()
+    default_workspace_root = Path(__file__).resolve().parents[3]
     router = LLMRouter(
         ollama=OllamaClient(get_env("OLLAMA_BASE_URL", "http://localhost:11434")),
         anthropic=LLMAnthropicClient(get_env("ANTHROPIC_API_KEY", "")),
@@ -191,7 +192,7 @@ def _build_admin_orchestrator() -> AdminOrchestrator:
     )
     return AdminOrchestrator(
         router=router,
-        workspace_root=Path(get_env("WORKSPACE_ROOT", ".")),
+        workspace_root=Path(get_env("WORKSPACE_ROOT", str(default_workspace_root))),
         agents_dir=get_env("AGENTS_DIR", "agents"),
         state_dir=get_env("STATE_DIR", "state"),
         runs_dir=get_env("RUNS_DIR", "runs"),

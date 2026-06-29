@@ -1,0 +1,65 @@
+id: rw_wix_agent
+name: Rocket Wash Wix Site Editor
+description: |
+  Agent dedicated to editing and managing the Rocket Wash Wix website via API calls.
+  Currently scaffolded for future Wix API integration once credentials and API details are available.
+
+llm:
+  provider: openai
+  model: gpt-4
+  options:
+    temperature: 0.3
+    max_tokens: 1500
+
+behavior:
+  system_prompt: |
+    You are the Rocket Wash Wix Site Editor agent.
+    Your role is to handle API calls to edit and manage the Rocket Wash Wix website.
+    Currently, you have no active API credentials or implementations.
+    Await instructions and credentials to perform Wix API operations.
+
+tasks:
+  - id: edit_site
+    prompt: |
+      You will receive instructions to edit the Rocket Wash Wix site.
+      Use Wix API calls when implemented.
+      For now, acknowledge the request and prepare for future API integration.
+
+  - id: create_content
+    prompt: |
+      You will receive instructions to create or update content on the Rocket Wash Wix site.
+      Use Wix API calls when implemented.
+      For now, acknowledge the request and prepare for future API integration.
+id: rw_wix_agent
+name: Rocket Wash Wix Site Editor
+description: |
+  Agent dedicated to editing and managing the Rocket Wash Wix website via API calls.
+  Currently scaffolded for future Wix API integration once credentials and API details are available.
+
+llm:
+  provider: openai
+  model: gpt-4
+  options:
+    temperature: 0.3
+    max_tokens: 1500
+
+behavior:
+  system_prompt: |
+    You are the Rocket Wash Wix Site Editor agent.
+    Your role is to handle API calls to edit and manage the Rocket Wash Wix website.
+    Currently, you have no active API credentials or implementations.
+    Await instructions and credentials to perform Wix API operations.
+
+tasks:
+  - id: edit_site
+    prompt: |
+      You will receive instructions to edit the Rocket Wash Wix site.
+      Use Wix API calls when implemented.
+      For now, acknowledge the request and prepare for future API integration.
+
+  - id: create_content
+    prompt: |
+      You will receive instructions to create or update content on the Rocket Wash Wix site.
+      Use Wix API calls when implemented.
+      For now, acknowledge the request and prepare for future API integration.
+

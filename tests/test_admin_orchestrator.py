@@ -1322,6 +1322,281 @@ def test_workspace_edit_without_write_artifacts_is_failed(tmp_path: Path):
     assert evaluation["completion_reason"] == "missing_execution_evidence"
 
 
+def test_workspace_edit_delegate_patch_is_applied_and_verified(tmp_path: Path):
+    class DelegateApplyRouter:
+        def chat(self, provider: str, model: str, system: str, user: str, options: dict | None = None) -> str:
+            _ = provider, system, options
+            if model == "admin-model" and "Reply with ONLY a JSON object" in user:
+                return json.dumps(
+                    {
+                        "status_update": "Routing through software_dev.",
+                        "task_type": "workspace_edit",
+                        "selected_agent": "software_dev",
+                        "delegate_prompt": "Create agents/foo.yaml.",
+                        "reply": "Applying delegated patch.",
+                        "tool_calls": [],
+                        "memory_updates": [],
+                        "needs_supervisor": False,
+                        "requires_user_input": False,
+                    }
+                )
+            if model == "worker-model":
+                return (
+                    "1) Concrete Deliverables\n"
+                    "- Create the requested agent file\n\n"
+                    "2) Target Files/Modules\n"
+                    "- agents/foo.yaml\n\n"
+                    "3) Code Snippets or Patch-Ready Blocks\n"
+                    "```diff\n"
+                    "--- /dev/null\n"
+                    "+++ b/agents/foo.yaml\n"
+                    "@@ -0,0 +1,2 @@\n"
+                    "+id: foo\n"
+                    "+name: Foo Agent\n"
+                    "```\n\n"
+                    "4) Validation Command(s) and observed result\n"
+                    "- validation: pytest -q\n"
+                    "- result: not run\n\n"
+                    "5) Blockers with exact missing inputs, if any\n"
+                    "- none"
+                )
+            return "Final response synthesized for Telegram."
+
+    agents_dir = tmp_path / "agents"
+    agents_dir.mkdir()
+    _write_agent(agents_dir / "admin.yaml", "admin", "Admin", "admin-model")
+    _write_agent(agents_dir / "software_dev.yaml", "software_dev", "Software Dev", "worker-model")
+
+    orchestrator = AdminOrchestrator(
+        router=DelegateApplyRouter(),
+        workspace_root=tmp_path,
+        agents_dir="agents",
+        state_dir="state",
+        runs_dir="runs",
+    )
+
+    messages = orchestrator.handle_message(chat_id=1, text="Create agents/foo.yaml using delegated workspace edit.")
+    assert messages[-1] == "Final response synthesized for Telegram."
+    assert (tmp_path / "agents" / "foo.yaml").exists()
+
+    interaction = _read_last_interaction(tmp_path)
+    assert interaction["status"] == "completed"
+    assert interaction["completion_reason"] == "criteria_met"
+
+
+def test_workspace_edit_delegate_claim_without_disk_write_fails_verification(tmp_path: Path):
+    class DelegateApplyRouter:
+        def chat(self, provider: str, model: str, system: str, user: str, options: dict | None = None) -> str:
+            _ = provider, system, options
+            if model == "admin-model" and "Reply with ONLY a JSON object" in user:
+                return json.dumps(
+                    {
+                        "status_update": "Routing through software_dev.",
+                        "task_type": "workspace_edit",
+                        "selected_agent": "software_dev",
+                        "delegate_prompt": "Create agents/foo.yaml.",
+                        "reply": "Applying delegated patch.",
+                        "tool_calls": [],
+                        "memory_updates": [],
+                        "needs_supervisor": False,
+                        "requires_user_input": False,
+                    }
+                )
+            if model == "worker-model":
+                return (
+                    "1) Concrete Deliverables\n"
+                    "- Create the requested agent file\n\n"
+                    "2) Target Files/Modules\n"
+                    "- agents/foo.yaml\n\n"
+                    "3) Code Snippets or Patch-Ready Blocks\n"
+                    "```diff\n"
+                    "--- /dev/null\n"
+                    "+++ b/agents/foo.yaml\n"
+                    "@@ -0,0 +1,2 @@\n"
+                    "+id: foo\n"
+                    "+name: Foo Agent\n"
+                    "```\n\n"
+                    "4) Validation Command(s) and observed result\n"
+                    "- validation: pytest -q\n"
+                    "- result: not run\n\n"
+                    "5) Blockers with exact missing inputs, if any\n"
+                    "- none"
+                )
+            return "Final response synthesized for Telegram."
+
+    agents_dir = tmp_path / "agents"
+    agents_dir.mkdir()
+    _write_agent(agents_dir / "admin.yaml", "admin", "Admin", "admin-model")
+    _write_agent(agents_dir / "software_dev.yaml", "software_dev", "Software Dev", "worker-model")
+
+    orchestrator = AdminOrchestrator(
+        router=DelegateApplyRouter(),
+        workspace_root=tmp_path,
+        agents_dir="agents",
+        state_dir="state",
+        runs_dir="runs",
+    )
+
+    original_execute = orchestrator.tools.execute
+
+    def fake_execute(calls):
+        results = []
+        for call in (calls or []):
+            if str(call.get("tool", "")).strip() == "write_file":
+                results.append({"tool": "write_file", "ok": True, "output": "simulated write skipped"})
+            else:
+                results.extend(original_execute([call]))
+        return results
+
+    orchestrator.tools.execute = fake_execute  # type: ignore[assignment]
+
+    orchestrator.handle_message(chat_id=2, text="Create agents/foo.yaml using delegated workspace edit.")
+
+    assert not (tmp_path / "agents" / "foo.yaml").exists()
+    interaction = _read_last_interaction(tmp_path)
+    assert interaction["status"] == "failed"
+    assert interaction["completion_reason"] == "delegate_disk_mismatch"
+
+
+def test_supervisor_reject_without_guidance_still_replans(tmp_path: Path):
+    class RejectNoGuidanceRouter:
+        def __init__(self):
+            self.planner_calls = 0
+            self.supervisor_calls = 0
+
+        def chat(self, provider: str, model: str, system: str, user: str, options: dict | None = None) -> str:
+            _ = provider, system, options
+            if model == "admin-model" and "Reply with ONLY a JSON object" in user:
+                self.planner_calls += 1
+                if "Supervisor re-plan attempt" in user and "--- Tool results" not in user:
+                    return json.dumps(
+                        {
+                            "status_update": "Supervisor-driven replan running.",
+                            "task_type": "workspace_edit",
+                            "selected_agent": "none",
+                            "delegate_prompt": "",
+                            "reply": "Running verification-first tools.",
+                            "tool_calls": [{"tool": "list_files", "path": ".", "limit": 5}],
+                            "memory_updates": [],
+                            "needs_supervisor": False,
+                            "requires_user_input": False,
+                        }
+                    )
+                if "--- Tool results" in user:
+                    return json.dumps(
+                        {
+                            "status_update": "Replan complete.",
+                            "task_type": "workspace_edit",
+                            "selected_agent": "none",
+                            "delegate_prompt": "",
+                            "reply": "Replan complete.",
+                            "tool_calls": [],
+                            "memory_updates": [],
+                            "needs_supervisor": False,
+                            "requires_user_input": False,
+                        }
+                    )
+                return json.dumps(
+                    {
+                        "status_update": "Routing through software_dev and supervisor.",
+                        "task_type": "workspace_edit",
+                        "selected_agent": "software_dev",
+                        "delegate_prompt": "Create agents/foo.yaml.",
+                        "reply": "Delegating patch.",
+                        "tool_calls": [],
+                        "memory_updates": [],
+                        "needs_supervisor": True,
+                        "requires_user_input": False,
+                    }
+                )
+            if model == "worker-model":
+                return (
+                    "1) Concrete Deliverables\n"
+                    "- Create the requested agent file\n\n"
+                    "2) Target Files/Modules\n"
+                    "- agents/foo.yaml\n\n"
+                    "3) Code Snippets or Patch-Ready Blocks\n"
+                    "```diff\n"
+                    "--- /dev/null\n"
+                    "+++ b/agents/foo.yaml\n"
+                    "@@ -0,0 +1,2 @@\n"
+                    "+id: foo\n"
+                    "+name: Foo Agent\n"
+                    "```\n\n"
+                    "4) Validation Command(s) and observed result\n"
+                    "- validation: pytest -q\n"
+                    "- result: not run\n\n"
+                    "5) Blockers with exact missing inputs, if any\n"
+                    "- none"
+                )
+            if model == "supervisor-model":
+                self.supervisor_calls += 1
+                if self.supervisor_calls == 1:
+                    return json.dumps(
+                        {
+                            "summary": "Reject and replan.",
+                            "risks": ["missing grounding"],
+                            "corrections": [],
+                            "approve": False,
+                            "next_actions": [],
+                            "tool_feedback": "",
+                            "task_feedback": "",
+                        }
+                    )
+                return json.dumps(
+                    {
+                        "summary": "Approved.",
+                        "risks": [],
+                        "corrections": [],
+                        "approve": True,
+                        "next_actions": [],
+                        "tool_feedback": "",
+                        "task_feedback": "",
+                    }
+                )
+            return "Final response synthesized for Telegram."
+
+    agents_dir = tmp_path / "agents"
+    agents_dir.mkdir()
+    _write_agent(agents_dir / "admin.yaml", "admin", "Admin", "admin-model")
+    _write_agent(agents_dir / "software_dev.yaml", "software_dev", "Software Dev", "worker-model")
+    _write_agent(
+        agents_dir / "supervisor.yaml",
+        "supervisor",
+        "Supervisor",
+        "supervisor-model",
+        provider="anthropic",
+    )
+
+    router = RejectNoGuidanceRouter()
+    orchestrator = AdminOrchestrator(
+        router=router,
+        workspace_root=tmp_path,
+        agents_dir="agents",
+        state_dir="state",
+        runs_dir="runs",
+    )
+
+    messages = orchestrator.handle_message(chat_id=3, text="Create agents/foo.yaml.")
+    assert not any("No active task in progress" in message for message in messages)
+    assert router.planner_calls >= 2
+
+
+def test_search_text_handles_non_numeric_limit(tmp_path: Path):
+    sample = tmp_path / "sample.txt"
+    sample.write_text("needle\n", encoding="utf-8")
+
+    executor = ToolExecutor(tmp_path)
+    results = executor.execute(
+        [
+            {"tool": "search_text", "path": ".", "query": "needle", "limit": "not-a-number"},
+        ]
+    )
+
+    assert results[0]["ok"] is True
+    assert "sample.txt:1: needle" in results[0]["output"]
+
+
 def test_policy_allows_helper_actions_without_approval(tmp_path: Path):
     config_dir = tmp_path / "config"
     config_dir.mkdir(parents=True, exist_ok=True)

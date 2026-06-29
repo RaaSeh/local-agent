@@ -301,6 +301,17 @@ class AdminOrchestrator:
                         )
                         return messages
 
+                    apply_results, apply_feedback = self._apply_delegate_output_to_workspace(
+                        chat_id=chat_id,
+                        owner_message=cleaned,
+                        plan=plan,
+                        delegate_output=delegate_output,
+                    )
+                    if apply_results:
+                        tool_results.extend(apply_results)
+                    if apply_feedback:
+                        messages.append(apply_feedback)
+
                     coding_brief_path = self._maybe_save_coding_agent_brief(
                         selected_agent=selected_agent,
                         owner_message=cleaned,
@@ -335,7 +346,12 @@ class AdminOrchestrator:
                 messages.append(digest_md)
                 approve_flag = review_record.get("approve")
                 has_retry_guidance = bool(review_record.get("corrections") or review_record.get("next_actions"))
-                if approve_flag is False and has_retry_guidance:
+                if approve_flag is False:
+                    if not has_retry_guidance:
+                        fallback_summary = str(review_record.get("summary", "")).strip()
+                        review_record["corrections"] = [
+                            fallback_summary or "Re-plan and run concrete verification-first tool calls before delegation."
+                        ]
                     if supervisor_replan_depth >= self._MAX_TOOL_ITERATIONS - 1:
                         messages.append(
                             f"I could not satisfy the supervisor after {self._MAX_TOOL_ITERATIONS} attempts: "
@@ -1085,7 +1101,17 @@ class AdminOrchestrator:
                 if gate_missing:
                     delegate_requires_input = True
                     delegate_output = self._format_delegate_gate_failure(delegate_plan, gate_missing)
-                elif delegate_plan.get("needs_supervisor"):
+                else:
+                    apply_results, _ = self._apply_delegate_output_to_workspace(
+                        chat_id=chat_id,
+                        owner_message=str(record.get("owner_message", "")).strip(),
+                        plan=delegate_plan,
+                        delegate_output=delegate_output,
+                    )
+                    if apply_results:
+                        tool_results.extend(apply_results)
+
+                if not gate_missing and delegate_plan.get("needs_supervisor"):
                     supervisor_cfg = self._load_agents().get("supervisor")
                     if supervisor_cfg:
                         review_record, _ = ToolSupervisor(self.router, supervisor_cfg).review(
@@ -1100,7 +1126,12 @@ class AdminOrchestrator:
                             supervisor_output = self._format_supervisor_feedback(review_record)
                         approve_flag = review_record.get("approve")
                         has_retry_guidance = bool(review_record.get("corrections") or review_record.get("next_actions"))
-                        if approve_flag is False and has_retry_guidance:
+                        if approve_flag is False:
+                            if not has_retry_guidance:
+                                fallback_summary = str(review_record.get("summary", "")).strip()
+                                review_record["corrections"] = [
+                                    fallback_summary or "Re-plan and run concrete verification-first tool calls before delegation."
+                                ]
                             if supervisor_replan_depth >= self._MAX_TOOL_ITERATIONS - 1:
                                 delegate_requires_input = True
                                 supervisor_output = (
@@ -1328,6 +1359,24 @@ class AdminOrchestrator:
             "download_file",
         }
         has_mutating_tool_evidence = any(tool in mutating_tools for tool in executed_tool_calls)
+        delegate_disk_verification = plan.get("delegate_disk_verification")
+        if isinstance(delegate_disk_verification, dict):
+            missing_paths = [
+                str(path)
+                for path in (delegate_disk_verification.get("missing_paths") or [])
+                if str(path).strip()
+            ]
+            if missing_paths:
+                evidence["notes"].append(
+                    "Delegate claimed file creation but post-apply verification found missing files on disk."
+                )
+                evidence["diagnostics"]["missing_paths"] = missing_paths
+                return {
+                    "status": "failed",
+                    "completion_reason": "delegate_disk_mismatch",
+                    "evidence": evidence,
+                    "execution_intent": True,
+                }
 
         if requires_user_input:
             if execution_intent and failed_tools:
@@ -1764,6 +1813,229 @@ class AdminOrchestrator:
             "no result",
         )
         return any(token in text for token in failure_tokens)
+
+    def _apply_delegate_output_to_workspace(
+        self,
+        chat_id: int,
+        owner_message: str,
+        plan: dict,
+        delegate_output: str,
+    ) -> tuple[list[dict], str]:
+        task_type = str(plan.get("task_type", "")).strip().lower()
+        if task_type not in {"workspace_edit", "code_support"}:
+            return [], ""
+
+        write_calls, claimed_created_paths = self._extract_delegate_write_calls(delegate_output)
+        if not write_calls:
+            plan["delegate_disk_verification"] = {
+                "claimed_created_paths": [],
+                "verified_paths": [],
+                "missing_paths": [],
+                "applied_writes": 0,
+            }
+            return [], ""
+
+        requires_approval = self.policy.tool_calls_require_approval(write_calls)
+        if requires_approval.requires_approval and not self._should_auto_approve(
+            chat_id=chat_id,
+            owner_message=owner_message,
+            tool_calls=write_calls,
+        ):
+            record = self.approvals.add_pending(
+                chat_id=chat_id,
+                owner_message=owner_message,
+                tool_calls=write_calls,
+                rationale=requires_approval.reason,
+                workspace=self.workspace_context.get_active_workspace(chat_id),
+                execution_plan=self._build_approval_execution_plan(
+                    owner_message=owner_message,
+                    plan=plan,
+                    include_tool_calls=False,
+                ),
+            )
+            plan["requires_user_input"] = True
+            return [], (
+                f"Approval required before applying delegated file changes. "
+                f"Use /approve {record['approval_id']} or /reject {record['approval_id']}"
+            )
+
+        apply_results = self.tools.execute(write_calls)
+
+        verification_calls: list[dict] = []
+        for rel_path in claimed_created_paths:
+            parent = str(Path(rel_path).parent).replace("\\", "/")
+            if not parent or parent == ".":
+                parent = "."
+            verification_calls.append({"tool": "list_files", "path": parent, "limit": 200})
+            verification_calls.append({"tool": "read_file", "path": rel_path, "start_line": 1, "end_line": 1})
+        verification_results = self.tools.execute(verification_calls) if verification_calls else []
+
+        missing_paths: list[str] = []
+        verified_paths: list[str] = []
+        for rel_path in claimed_created_paths:
+            abs_path = (self.workspace_root / rel_path).resolve()
+            if abs_path.exists():
+                verified_paths.append(rel_path)
+            else:
+                missing_paths.append(rel_path)
+
+        plan["delegate_disk_verification"] = {
+            "claimed_created_paths": claimed_created_paths,
+            "verified_paths": verified_paths,
+            "missing_paths": missing_paths,
+            "applied_writes": len(write_calls),
+        }
+
+        if missing_paths:
+            mismatch = (
+                "Delegate claimed to create files, but they are missing on disk: "
+                + ", ".join(missing_paths)
+            )
+            verification_results.append(
+                {
+                    "tool": "delegate_post_apply_verification",
+                    "ok": False,
+                    "output": mismatch,
+                }
+            )
+            return [*apply_results, *verification_results], mismatch
+
+        return [*apply_results, *verification_results], ""
+
+    def _extract_delegate_write_calls(self, delegate_output: str) -> tuple[list[dict], list[str]]:
+        if not str(delegate_output or "").strip():
+            return [], []
+        writes, claimed_created = self._extract_unified_diff_writes(delegate_output)
+        deduped: dict[str, dict] = {}
+        for call in writes:
+            path = str(call.get("path", "")).strip()
+            if path:
+                deduped[path] = call
+        unique_claimed: list[str] = []
+        for path in claimed_created:
+            if path not in unique_claimed:
+                unique_claimed.append(path)
+        return list(deduped.values()), unique_claimed
+
+    def _extract_unified_diff_writes(self, text: str) -> tuple[list[dict], list[str]]:
+        lines = (text or "").splitlines()
+        writes: list[dict] = []
+        claimed_created: list[str] = []
+        i = 0
+        while i < len(lines):
+            if not lines[i].startswith("--- "):
+                i += 1
+                continue
+
+            old_label = lines[i][4:].strip().split("\t", 1)[0]
+            i += 1
+            if i >= len(lines) or not lines[i].startswith("+++ "):
+                continue
+            new_label = lines[i][4:].strip().split("\t", 1)[0]
+            i += 1
+
+            rel_path = self._normalize_delegate_patch_path(new_label)
+            if not rel_path:
+                continue
+
+            hunks: list[tuple[int, list[str]]] = []
+            while i < len(lines):
+                line = lines[i]
+                if line.startswith("--- "):
+                    break
+                if not line.startswith("@@ "):
+                    i += 1
+                    continue
+
+                old_start = self._parse_unified_hunk_header(line)
+                i += 1
+                hunk_lines: list[str] = []
+                while i < len(lines):
+                    hunk_line = lines[i]
+                    if hunk_line.startswith("@@ ") or hunk_line.startswith("--- "):
+                        break
+                    if hunk_line.startswith((" ", "+", "-", "\\")):
+                        hunk_lines.append(hunk_line)
+                    i += 1
+                hunks.append((old_start, hunk_lines))
+
+            if not hunks:
+                continue
+
+            content = self._apply_unified_diff_to_file(rel_path, hunks)
+            writes.append({"tool": "write_file", "path": rel_path, "content": content})
+
+            if old_label.strip() in {"/dev/null", "nul"} or not (self.workspace_root / rel_path).exists():
+                claimed_created.append(rel_path)
+
+        return writes, claimed_created
+
+    def _normalize_delegate_patch_path(self, raw_label: str) -> str:
+        label = str(raw_label or "").strip()
+        if not label or label in {"/dev/null", "nul"}:
+            return ""
+        if label.startswith("a/") or label.startswith("b/"):
+            label = label[2:]
+        candidate = (self.workspace_root / label).resolve()
+        try:
+            relative = candidate.relative_to(self.workspace_root)
+        except ValueError:
+            return ""
+        return str(relative).replace("\\", "/")
+
+    @staticmethod
+    def _parse_unified_hunk_header(header: str) -> int:
+        match = re.match(r"^@@\s+-(\d+)(?:,\d+)?\s+\+(\d+)(?:,\d+)?\s+@@", header.strip())
+        if not match:
+            return 1
+        try:
+            old_start = int(match.group(1))
+        except (TypeError, ValueError):
+            old_start = 1
+        return old_start
+
+    def _apply_unified_diff_to_file(self, rel_path: str, hunks: list[tuple[int, list[str]]]) -> str:
+        target = (self.workspace_root / rel_path).resolve()
+        if target.exists():
+            original_lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
+        else:
+            original_lines = []
+
+        output: list[str] = []
+        src_index = 0
+
+        for old_start, hunk_lines in hunks:
+            start_index = max(old_start - 1, 0)
+            if start_index > len(original_lines):
+                start_index = len(original_lines)
+            if start_index > src_index:
+                output.extend(original_lines[src_index:start_index])
+                src_index = start_index
+
+            for raw_line in hunk_lines:
+                if not raw_line:
+                    output.append("")
+                    continue
+                prefix = raw_line[:1]
+                text = raw_line[1:]
+                if prefix == " ":
+                    output.append(text)
+                    if src_index < len(original_lines):
+                        src_index += 1
+                elif prefix == "-":
+                    if src_index < len(original_lines):
+                        src_index += 1
+                elif prefix == "+":
+                    output.append(text)
+                elif prefix == "\\":
+                    continue
+
+        if src_index < len(original_lines):
+            output.extend(original_lines[src_index:])
+
+        if not output:
+            return ""
+        return "\n".join(output) + "\n"
 
     def _review_with_supervisor(self, agent_cfg: dict, owner_message: str, delegate_output: str) -> str:
         supervisor_cfg = self._load_agents().get("supervisor")
