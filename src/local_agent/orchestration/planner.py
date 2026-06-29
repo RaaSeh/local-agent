@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
 
 from local_agent.core.run_once import resolve_agent_llm
 from local_agent.orchestration.registry import TaskRegistry
+
+
+logger = logging.getLogger(__name__)
 
 
 def _parse_json(raw: str) -> dict:
@@ -68,9 +72,14 @@ class ToolPlanner:
         memory_context: str,
         allowed_agents: list[str],
         trusted: bool = False,
+        route_task_type: str | None = None,
     ) -> dict:
         resolved = resolve_agent_llm(self.agent_cfg, task_context=owner_message)
-        route_hint = self.registry.route_for(owner_message)
+        route_hint = (
+            self.registry.route_for_task_type(route_task_type)
+            if route_task_type
+            else self.registry.route_for(owner_message)
+        )
         allowed_tools = self.registry.render_tool_manifest(route_hint.task_type, trusted=trusted)
 
         system = (
@@ -81,7 +90,7 @@ class ToolPlanner:
         )
         user = (
             "Reply with ONLY a JSON object containing exactly these keys:\n"
-            "status_update, task_type, selected_agent, delegate_prompt, reply, tool_calls,\n"
+            "status_update, selected_agent, delegate_prompt, reply, tool_calls,\n"
             "memory_kind, memory_updates, needs_supervisor, requires_user_input, rationale,\n"
             "tool_research, requires_confirmation\n\n"
             f"Owner message: {owner_message}\n\n"
@@ -90,8 +99,10 @@ class ToolPlanner:
             f"Tool manifest:\n{allowed_tools}\n\n"
             f"Memory context:\n{memory_context}\n\n"
             "Routing rules:\n"
+            "- When the owner names specific tools to use (e.g. list_files, read_file, search_text), populate the tool_calls array directly with those calls. NEVER delegate owner-specified tool operations to another agent. Delegation is only for tasks that require an agent's reasoning, not for direct file or inspection operations.\n"
             "- If the request is best served by direct tools, keep selected_agent as none and add concrete tool_calls.\n"
             "- For desktop_execution, environment, tool_acquisition, and workspace_edit tasks, prefer selected_agent=none with direct tool_calls unless the tool manifest cannot satisfy the request.\n"
+            "- For workspace_inspection tasks, selected_agent must be none, delegate_prompt must be empty, and tool_calls must contain direct list_files/read_file/search_text calls.\n"
             "- If a required capability may be missing, prefer check_capability first and then install/scaffold/download the missing capability in the same plan when the target is clear.\n"
             "- If the request needs a specialist worker, choose exactly one selected_agent and keep tool_calls empty unless the tools are strictly necessary.\n"
             "- For delegated coding/CAD tasks, delegate_prompt must be concrete and implementation-ready (specific deliverables, file or module targets, and acceptance checks).\n"
@@ -112,7 +123,7 @@ class ToolPlanner:
         parsed = _parse_json(raw)
 
         parsed.setdefault("status_update", "")
-        parsed.setdefault("task_type", route_hint.task_type)
+        parsed["task_type"] = route_hint.task_type
         parsed.setdefault("selected_agent", route_hint.recommended_agent)
         parsed.setdefault("delegate_prompt", "")
         parsed.setdefault("reply", raw.strip())
@@ -130,17 +141,31 @@ class ToolPlanner:
         if not isinstance(parsed.get("memory_updates"), list):
             parsed["memory_updates"] = []
 
-        fallback_route = {"desktop_execution", "environment", "tool_acquisition", "workspace_edit"}
-        parsed_task_type = str(parsed.get("task_type", "")).strip()
-        if route_hint.task_type in fallback_route and parsed_task_type not in fallback_route:
-            parsed["task_type"] = route_hint.task_type
-
         parsed["tool_calls"] = self.registry.filter_tool_calls(
             parsed["task_type"],
             parsed["tool_calls"],
             trusted=trusted,
         )
 
+        if parsed.get("task_type") == "workspace_inspection":
+            if str(parsed.get("selected_agent", "")).strip().lower() not in {"", "none", "admin"}:
+                logger.warning(
+                    "Planner emitted delegated selected_agent for no-delegate workspace_inspection route; stripping delegation"
+                )
+            if str(parsed.get("delegate_prompt", "")).strip():
+                logger.warning(
+                    "Planner emitted delegate_prompt for no-delegate workspace_inspection route; stripping delegation"
+                )
+            parsed["selected_agent"] = "none"
+            parsed["delegate_prompt"] = ""
+            if not parsed["tool_calls"]:
+                parsed["tool_calls"] = self.registry.filter_tool_calls(
+                    parsed["task_type"],
+                    self._infer_workspace_inspection_tool_calls(owner_message),
+                    trusted=trusted,
+                )
+
+        fallback_route = {"desktop_execution", "environment", "tool_acquisition", "workspace_edit"}
         if parsed.get("task_type") in fallback_route:
             parsed["selected_agent"] = "none"
             if not parsed["tool_calls"]:
@@ -156,7 +181,7 @@ class ToolPlanner:
 
         # For inspection/general tasks the LLM sometimes skips tool_calls entirely.
         # Infer list_files directly so desktop-relative paths are always resolved.
-        if parsed.get("task_type") in {"inspection", "general"} and not parsed.get("tool_calls"):
+        if parsed.get("task_type") in {"inspection", "workspace_inspection", "general"} and not parsed.get("tool_calls"):
             inferred = self._infer_fallback_tool_calls(
                 owner_message=owner_message,
                 task_type=str(parsed.get("task_type", "")),
@@ -171,9 +196,6 @@ class ToolPlanner:
         if not parsed.get("selected_agent"):
             parsed["selected_agent"] = route_hint.recommended_agent
 
-        if not parsed.get("task_type"):
-            parsed["task_type"] = route_hint.task_type
-
         if self.registry.confirmation_required(parsed["task_type"], parsed["tool_calls"]):
             parsed["requires_confirmation"] = True
 
@@ -183,6 +205,9 @@ class ToolPlanner:
         text = (owner_message or "").strip()
         lowered = text.lower()
         calls: list[dict] = []
+
+        if task_type == "workspace_inspection":
+            return self._infer_workspace_inspection_tool_calls(owner_message)
 
         if task_type == "desktop_execution" and "alibre" in lowered:
             calls.append(
@@ -265,6 +290,30 @@ class ToolPlanner:
                 raw_target = text[start:end].strip()
                 calls.append({"tool": "list_files", "path": raw_target})
         return calls
+
+    def _infer_workspace_inspection_tool_calls(self, owner_message: str) -> list[dict]:
+        lowered = (owner_message or "").lower()
+        calls: list[dict] = []
+
+        if "list_files" in lowered:
+            calls.append({"tool": "list_files", "path": ".", "limit": 120})
+        if "search_text" in lowered:
+            calls.append({"tool": "search_text", "path": ".", "query": "TODO", "limit": 50})
+        if "read_file" in lowered:
+            calls.append({"tool": "read_file", "path": "README.md", "start_line": 1, "end_line": 120})
+
+        if not calls:
+            calls.append({"tool": "list_files", "path": ".", "limit": 120})
+        return calls[:5]
+
+    def _owner_named_inspection_tools(self, owner_message: str) -> bool:
+        lowered = (owner_message or "").lower()
+        # Re-plan contexts append tool-result blocks that can mention tool names;
+        # only inspect the owner-facing prefix when deciding explicit tool intent.
+        owner_prefix = lowered.split("--- tool results", 1)[0]
+        has_named_tool = any(name in owner_prefix for name in ("list_files", "read_file", "search_text"))
+        has_directive = any(marker in owner_prefix for marker in ("use only", "use", "only"))
+        return has_named_tool and has_directive
 
 
 def registry_to_json(route_hint) -> str:

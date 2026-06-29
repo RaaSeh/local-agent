@@ -84,7 +84,17 @@
       "value": "```json\n{\n  \"summary\": \"REJECT THIS OUTPUT - COMPLETE PROCESS FAILURE. Owner provided detailed diagnostic context with specific file paths, line numbers, and code-path issues requiring actual code modifications. This is an EXECUTION task requiring: (1) actual file edits to admin.py, tools.py, and pl",
       "source": "supervisor",
       "recorded_at": "2026-06-03T21:50:39.685492+00:00"
+    },
+    {
+      "value": "REJECT - COMPLETE PROCESS FAILURE. Owner explicitly requested read-only inspection using 'list_files, read_file, and search_text' tools. Planner selected 'delegated_work' but executed ZERO tools. Delegate produced a fantasy report claiming to have performed inspections that never occurred. No actual",
+      "source": "supervisor",
+      "recorded_at": "2026-06-29T03:28:51.100435+00:00"
+    },
+    {
+      "value": "```json\n{\n  \"summary\": \"REJECT THIS OUTPUT - EXECUTION TASK TREATED AS PLANNING EXERCISE. Owner provided explicit diagnostic context with file paths and line numbers requiring actual code modifications. Planner correctly selected 'delegated_work' but EXECUTED ZERO TOOLS. Delegate produced a diff pat",
+      "source": "supervisor",
+      "recorded_at": "2026-06-29T16:46:25.627781+00:00"
     }
   ],
-  "updated_at": "2026-06-03T21:50:39.685492+00:00"
+  "updated_at": "2026-06-29T16:46:25.627781+00:00"
 }

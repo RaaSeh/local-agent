@@ -15,6 +15,7 @@ behavior:
     - Produce a concise digest suitable for reading on a phone.
     - Act as a devil's advocate: challenge weak assumptions and reject low-evidence leads.
     - Focus on lead generation quality only.
+    - Do not wrap file names or code paths in markdown links or invent URLs. Refer to files as plain inline code, e.g. `admin.py`.
 
     Review rules for local lead-generation outputs:
     - Reject any lead that appears fabricated or lacks evidence.

@@ -103,7 +103,9 @@ class AdminOrchestrator:
         if explicit_agent:
             return self._run_direct_agent(chat_id=chat_id, agent_id=explicit_agent, prompt=explicit_prompt)
 
-        plan = self._plan_request(chat_id=chat_id, owner_message=cleaned)
+        initial_route = self.registry.route_for(cleaned)
+        route_task_type = initial_route.task_type
+        plan = self._plan_request(chat_id=chat_id, owner_message=cleaned, route_task_type=route_task_type)
         # Apply any direct memory updates from plan, plus always record the
         # owner message so we can extract facts from it later via memory_kind.
         memory_updates = list(plan.get("memory_updates") or [])
@@ -159,7 +161,12 @@ class AdminOrchestrator:
             )
             return messages
 
-        plan, tool_results = self._run_tool_loop(cleaned, plan, chat_id=chat_id)
+        plan, tool_results = self._run_tool_loop(
+            cleaned,
+            plan,
+            chat_id=chat_id,
+            route_task_type=route_task_type,
+        )
         if tool_results:
             messages.append(self._format_tool_feedback(tool_results))
         delegate_output = ""
@@ -197,74 +204,103 @@ class AdminOrchestrator:
                 delegate_output = self._run_delegated_agent(agent_cfg, cleaned, plan, tool_results)
                 delegate_iterations = 1
 
-                gate_missing = self._validate_delegate_output(cleaned, plan, delegate_output)
-                repair_attempt = 0
-                while gate_missing and repair_attempt < self._MAX_DELEGATE_REPAIR_ATTEMPTS:
-                    repair_attempt += 1
-                    repaired_plan = dict(plan)
-                    repaired_plan["delegate_prompt"] = self._build_delegate_repair_prompt(
-                        base_delegate_prompt=str(plan.get("delegate_prompt", "")).strip() or cleaned,
-                        prior_output=delegate_output,
-                        missing_sections=gate_missing,
+                if self._is_fabricated_delegation(
+                    delegate_output,
+                    tool_results,
+                    task_type=str(plan.get("task_type", "")).strip(),
+                ):
+                    delegate_output = ""
+                    selected_agent = "none"
+                    plan["selected_agent"] = "none"
+                    plan["delegate_prompt"] = ""
+                    correction_note = "previous delegation produced no tool results; make direct tool calls"
+                    replanned_context = f"{cleaned}\n\nDelegation integrity correction: {correction_note}"
+                    repaired_plan = self._plan_request(
+                        chat_id=chat_id,
+                        owner_message=replanned_context,
+                        route_task_type=route_task_type,
                     )
-                    delegate_output = self._run_delegated_agent(agent_cfg, cleaned, repaired_plan, tool_results)
-                    delegate_iterations += 1
+                    repaired_plan["selected_agent"] = "none"
+                    repaired_plan["delegate_prompt"] = ""
+                    repaired_plan, repaired_results = self._run_tool_loop(
+                        replanned_context,
+                        repaired_plan,
+                        chat_id=chat_id,
+                        route_task_type=route_task_type,
+                    )
+                    if repaired_results:
+                        tool_results.extend(repaired_results)
+                        messages.append(self._format_tool_feedback(repaired_results))
+                    plan = repaired_plan
+                else:
                     gate_missing = self._validate_delegate_output(cleaned, plan, delegate_output)
+                    repair_attempt = 0
+                    while gate_missing and repair_attempt < self._MAX_DELEGATE_REPAIR_ATTEMPTS:
+                        repair_attempt += 1
+                        repaired_plan = dict(plan)
+                        repaired_plan["delegate_prompt"] = self._build_delegate_repair_prompt(
+                            base_delegate_prompt=str(plan.get("delegate_prompt", "")).strip() or cleaned,
+                            prior_output=delegate_output,
+                            missing_sections=gate_missing,
+                        )
+                        delegate_output = self._run_delegated_agent(agent_cfg, cleaned, repaired_plan, tool_results)
+                        delegate_iterations += 1
+                        gate_missing = self._validate_delegate_output(cleaned, plan, delegate_output)
 
-                if gate_missing:
-                    gate_feedback = self._format_delegate_gate_failure(plan, gate_missing)
-                    plan["requires_user_input"] = True
-                    messages.append(gate_feedback)
+                    if gate_missing:
+                        gate_feedback = self._format_delegate_gate_failure(plan, gate_missing)
+                        plan["requires_user_input"] = True
+                        messages.append(gate_feedback)
 
-                    self.memory.append_interaction(
-                        {
-                            "chat_id": chat_id,
-                            "user_message": cleaned,
-                            "selected_agent": selected_agent or "admin",
-                            "status": "needs-input",
-                            "summary": gate_feedback[:220],
-                        }
+                        self.memory.append_interaction(
+                            {
+                                "chat_id": chat_id,
+                                "user_message": cleaned,
+                                "selected_agent": selected_agent or "admin",
+                                "status": "needs-input",
+                                "summary": gate_feedback[:220],
+                            }
+                        )
+                        return messages
+
+                    recovery_attempt = 0
+                    while self._delegate_output_needs_recovery(delegate_output) and recovery_attempt < self._MAX_DELEGATE_RECOVERY_ATTEMPTS:
+                        recovery_attempt += 1
+                        repaired_plan = dict(plan)
+                        repaired_plan["delegate_prompt"] = self._build_delegate_failure_repair_prompt(
+                            base_delegate_prompt=str(plan.get("delegate_prompt", "")).strip() or cleaned,
+                            prior_output=delegate_output,
+                        )
+                        delegate_output = self._run_delegated_agent(agent_cfg, cleaned, repaired_plan, tool_results)
+                        delegate_iterations += 1
+
+                    if self._delegate_output_needs_recovery(delegate_output):
+                        plan["requires_user_input"] = True
+                        failure_text = (
+                            "Delegate recovery exhausted. Output is still non-executable or deflecting. "
+                            "Reply with /work and specify whether to continue with hosted codex/software_dev routing."
+                        )
+                        messages.append(failure_text)
+                        self.memory.append_interaction(
+                            {
+                                "chat_id": chat_id,
+                                "user_message": cleaned,
+                                "selected_agent": selected_agent or "admin",
+                                "status": "needs-input",
+                                "summary": failure_text[:220],
+                            }
+                        )
+                        return messages
+
+                    coding_brief_path = self._maybe_save_coding_agent_brief(
+                        selected_agent=selected_agent,
+                        owner_message=cleaned,
+                        plan=plan,
+                        tool_results=tool_results,
+                        delegate_output=delegate_output,
                     )
-                    return messages
-
-                recovery_attempt = 0
-                while self._delegate_output_needs_recovery(delegate_output) and recovery_attempt < self._MAX_DELEGATE_RECOVERY_ATTEMPTS:
-                    recovery_attempt += 1
-                    repaired_plan = dict(plan)
-                    repaired_plan["delegate_prompt"] = self._build_delegate_failure_repair_prompt(
-                        base_delegate_prompt=str(plan.get("delegate_prompt", "")).strip() or cleaned,
-                        prior_output=delegate_output,
-                    )
-                    delegate_output = self._run_delegated_agent(agent_cfg, cleaned, repaired_plan, tool_results)
-                    delegate_iterations += 1
-
-                if self._delegate_output_needs_recovery(delegate_output):
-                    plan["requires_user_input"] = True
-                    failure_text = (
-                        "Delegate recovery exhausted. Output is still non-executable or deflecting. "
-                        "Reply with /work and specify whether to continue with hosted codex/software_dev routing."
-                    )
-                    messages.append(failure_text)
-                    self.memory.append_interaction(
-                        {
-                            "chat_id": chat_id,
-                            "user_message": cleaned,
-                            "selected_agent": selected_agent or "admin",
-                            "status": "needs-input",
-                            "summary": failure_text[:220],
-                        }
-                    )
-                    return messages
-
-                coding_brief_path = self._maybe_save_coding_agent_brief(
-                    selected_agent=selected_agent,
-                    owner_message=cleaned,
-                    plan=plan,
-                    tool_results=tool_results,
-                    delegate_output=delegate_output,
-                )
-                if bool(plan.get("needs_supervisor")):
-                    supervisor_output = self._review_with_supervisor(agent_cfg, cleaned, delegate_output)
+                    if bool(plan.get("needs_supervisor")):
+                        supervisor_output = self._review_with_supervisor(agent_cfg, cleaned, delegate_output)
 
         if coding_brief_path:
             messages.append(f"Coding-agent brief: {coding_brief_path}")
@@ -472,7 +508,13 @@ class AdminOrchestrator:
         "opencv": "opencv-python",
     }
 
-    def _run_tool_loop(self, owner_message: str, initial_plan: dict, chat_id: int = 0) -> tuple[dict, list[dict]]:
+    def _run_tool_loop(
+        self,
+        owner_message: str,
+        initial_plan: dict,
+        chat_id: int = 0,
+        route_task_type: str | None = None,
+    ) -> tuple[dict, list[dict]]:
         """Execute tool calls from the plan, then re-plan with results up to
         MAX_TOOL_ITERATIONS times.  Stops early when the plan emits no more
         tool_calls (i.e. the LLM signals it is done acting and wants to
@@ -509,7 +551,11 @@ class AdminOrchestrator:
                         "\n\nBased on the above results, produce an updated plan JSON. "
                         "If no further tools are needed, set tool_calls to [] and choose a selected_agent or provide a direct reply."
                     )
-                    plan = self._plan_request(chat_id=chat_id, owner_message=accumulated_context)
+                    plan = self._plan_request(
+                        chat_id=chat_id,
+                        owner_message=accumulated_context,
+                        route_task_type=route_task_type,
+                    )
                     continue
 
                 record = self.approvals.add_pending(
@@ -566,7 +612,11 @@ class AdminOrchestrator:
                 )
 
             # Re-plan with the enriched context
-            plan = self._plan_request(chat_id=chat_id, owner_message=accumulated_context)
+            plan = self._plan_request(
+                chat_id=chat_id,
+                owner_message=accumulated_context,
+                route_task_type=route_task_type,
+            )
 
             if execution_intent and has_failed_tools:
                 plan["selected_agent"] = "none"
@@ -826,7 +876,12 @@ class AdminOrchestrator:
                 found.append(package_name)
         return found[:3]
 
-    def _plan_request(self, chat_id: int, owner_message: str) -> dict:
+    def _plan_request(
+        self,
+        chat_id: int,
+        owner_message: str,
+        route_task_type: str | None = None,
+    ) -> dict:
         admin_cfg = self._load_agents().get("admin")
         if not admin_cfg:
             raise RuntimeError("Missing agents/admin.yaml")
@@ -846,6 +901,7 @@ class AdminOrchestrator:
             memory_context=enriched_memory_context,
             allowed_agents=worker_ids,
             trusted=trusted,
+            route_task_type=route_task_type,
         )
 
     def _render_pending_approvals(self, chat_id: int) -> str:
@@ -1390,6 +1446,7 @@ class AdminOrchestrator:
         if selected_agent == "codex":
             return (
                 "You are the implementation agent. Write the patch directly.\n"
+                "If you receive a task but have no tools available in your manifest, you MUST respond exactly with a failure: 'CANNOT_EXECUTE: no tools available for this task.' You must NEVER describe, summarize, or claim actions (file reads, searches, inspections) that you did not actually perform via tool calls.\n"
                 "Required sections:\n"
                 "1) Concrete Deliverables (what is implemented)\n"
                 "2) Changed Files (exact file paths)\n"
@@ -1423,6 +1480,39 @@ class AdminOrchestrator:
         return (
             "Return concrete, actionable output with explicit deliverables and validation steps."
         )
+
+    def _is_fabricated_delegation(self, delegate_output: str, tool_results: list[dict], task_type: str = "") -> bool:
+        normalized_task_type = str(task_type or "").strip().lower()
+        if normalized_task_type not in {"workspace_inspection", "inspection"}:
+            return False
+
+        text = (delegate_output or "").strip()
+        if not text:
+            return False
+        if tool_results:
+            return False
+        lowered = text.lower()
+        if "cannot_execute: no tools available for this task." in lowered:
+            return False
+
+        # Narrative claims of inspection without execution evidence are treated as fabricated output.
+        if len(lowered.split()) < 8:
+            return False
+        action_tokens = (
+            "inspected",
+            "inspection",
+            "read",
+            "searched",
+            "scanned",
+            "reviewed",
+            "analyzed",
+            "file",
+            "files",
+            "workspace",
+            "directory",
+            "line",
+        )
+        return any(token in lowered for token in action_tokens)
 
     def _validate_delegate_output(self, owner_message: str, plan: dict, delegate_output: str) -> list[str]:
         selected_agent = str(plan.get("selected_agent", "")).strip().lower()

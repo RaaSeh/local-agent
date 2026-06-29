@@ -2,10 +2,10 @@ id: software_dev
 name: Software Developer Agent
 description: Iterates on agentic software development approach and proposes experiments.
 llm:
-  provider: ollama
+  provider: openai
   # Good balance for 24GB VRAM: stronger coding model while staying practical.
   # For even larger compressed models, use tags like: qwen2.5-coder:32b-instruct-q4_K_M
-  model: llama3.1:8b
+  model: gpt-4.1-mini
   options_env: SOFTWARE_DEV_OLLAMA_OPTIONS
   options:
     temperature: 0.1

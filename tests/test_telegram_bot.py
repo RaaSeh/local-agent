@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import json
 import os
 import time
+from pathlib import Path
 from fastapi.testclient import TestClient
 
 from local_agent.integrations import google_chat_bot
 from local_agent.integrations import telegram_bot
+from local_agent.orchestration.admin import AdminOrchestrator
 from local_agent.orchestration.memory import MemoryStore
 from local_agent.workflows.intake import IntakeSession
 
@@ -56,6 +59,12 @@ class _DummyAdmin:
         return [f"admin:{text}"]
 
 
+class _FailingAdmin:
+    def handle_message(self, chat_id: int, text: str) -> list[str]:
+        _ = chat_id, text
+        raise RuntimeError("ollama connection refused")
+
+
 class _DummyIntakeConductor:
     def __init__(self, anthropic_client, prompt_dir):
         _ = anthropic_client
@@ -70,6 +79,65 @@ class _DummyIntakeConductor:
         _ = session
         _ = user_message
         return "intake-followup"
+
+
+class _AdversarialPlannerRouter:
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def chat(self, provider: str, model: str, system: str, user: str, options: dict | None = None) -> str:
+        self.calls.append(
+            {
+                "provider": provider,
+                "model": model,
+                "system": system,
+                "user": user,
+                "options": options or {},
+            }
+        )
+        if model == "admin-model" and "Reply with ONLY a JSON object" in user:
+            return json.dumps(
+                {
+                    "status_update": "Attempting delegated coding route.",
+                    "task_type": "code_support",
+                    "selected_agent": "codex",
+                    "delegate_prompt": "Delegate this to codex.",
+                    "reply": "",
+                    "tool_calls": [],
+                    "memory_updates": [],
+                    "needs_supervisor": False,
+                    "requires_user_input": False,
+                    "rationale": "delegate anyway",
+                }
+            )
+        if model == "admin-model":
+            return "Final response synthesized for Telegram."
+        if model == "worker-model":
+            return "Delegated worker output should not be reached in workspace inspection tests."
+        raise AssertionError(f"Unexpected model {model}")
+
+
+def _write_agent(path: Path, agent_id: str, model: str, provider: str = "openai") -> None:
+    path.write_text(
+        "\n".join(
+            [
+                f"id: {agent_id}",
+                f"name: {agent_id}",
+                "description: test agent",
+                "llm:",
+                f"  provider: {provider}",
+                f"  model: {model}",
+                "behavior:",
+                "  system_prompt: |",
+                "    You are a test agent.",
+                "tasks:",
+                "  - id: t",
+                "    prompt: |",
+                "      Test task.",
+            ]
+        ),
+        encoding="utf-8",
+    )
 
 
 def _build_bot(monkeypatch):
@@ -122,6 +190,102 @@ def test_work_plain_deeplink_routes_to_workspace(monkeypatch):
 
     assert admin.calls == [(chat_id, "list files in desktop/RW_Media")]
     assert sent[-1] == (chat_id, "admin:list files in desktop/RW_Media")
+
+
+def test_work_markdown_deeplink_parses_multiline_payload(monkeypatch):
+    bot, _admin, _sent = _build_bot(monkeypatch)
+
+    command, payload = bot._parse_command(
+        "[/work](tg://bot_command?command=work)\n"
+        "Inspect this workspace in read-only mode for architecture.\n"
+        "Use only list_files, read_file, and search_text."
+    )
+
+    assert command == "/work"
+    assert "Inspect this workspace" in payload
+    assert "Use only list_files, read_file, and search_text." in payload
+
+
+def test_work_multiline_payload_forces_workspace_inspection_and_blocks_delegation(monkeypatch, tmp_path: Path):
+    monkeypatch.delenv("TELEGRAM_ALLOWED_CHAT_IDS", raising=False)
+    monkeypatch.setattr(telegram_bot, "_build_runner", lambda: _DummyRunner())
+    monkeypatch.setattr(telegram_bot, "IntakeConductor", _DummyIntakeConductor)
+
+    agents_dir = tmp_path / "agents"
+    agents_dir.mkdir(parents=True, exist_ok=True)
+    _write_agent(agents_dir / "admin.yaml", "admin", "admin-model")
+    _write_agent(agents_dir / "codex.yaml", "codex", "worker-model")
+
+    router = _AdversarialPlannerRouter()
+    orchestrator = AdminOrchestrator(
+        router=router,
+        workspace_root=tmp_path,
+        agents_dir=agents_dir,
+        state_dir=tmp_path / "state",
+        runs_dir=tmp_path / "runs",
+    )
+
+    captured_plans: list[dict] = []
+    original_plan_request = orchestrator._plan_request
+
+    def _capture_plan_request(chat_id: int, owner_message: str, route_task_type: str | None = None) -> dict:
+        plan = original_plan_request(chat_id=chat_id, owner_message=owner_message, route_task_type=route_task_type)
+        captured_plans.append(
+            {
+                "route_task_type": route_task_type,
+                "task_type": plan.get("task_type"),
+                "selected_agent": plan.get("selected_agent"),
+                "tool_calls": list(plan.get("tool_calls") or []),
+            }
+        )
+        return plan
+
+    orchestrator._plan_request = _capture_plan_request  # type: ignore[method-assign]
+    monkeypatch.setattr(telegram_bot, "_build_admin_orchestrator", lambda: orchestrator)
+
+    bot = telegram_bot.TelegramBotRunner(token="token")
+    sent: list[tuple[int, str]] = []
+    bot._send_message = lambda chat_id, text: sent.append((chat_id, text))
+
+    bot._reply_with_agent(
+        501,
+        "[/work](tg://bot_command?command=work)\n"
+        "Inspect this workspace in read-only mode for architecture.\n"
+        "Use only list_files, read_file, and search_text.",
+    )
+
+    assert captured_plans, "Expected planner to be invoked through admin orchestration"
+    assert captured_plans[0]["route_task_type"] == "workspace_inspection"
+    assert all(plan["task_type"] == "workspace_inspection" for plan in captured_plans)
+    assert all(str(plan["selected_agent"]).strip().lower() in {"none", "admin", ""} for plan in captured_plans)
+    assert any(plan["tool_calls"] for plan in captured_plans)
+    assert not any(call.get("model") == "worker-model" for call in router.calls)
+
+    interactions_path = tmp_path / "state" / "interactions.jsonl"
+    assert interactions_path.exists(), "Expected interaction evidence to be written"
+    interaction = json.loads(interactions_path.read_text(encoding="utf-8").splitlines()[-1])
+    assert interaction.get("selected_agent") == "admin"
+    executed = interaction.get("evidence", {}).get("executed_tool_calls", [])
+    assert isinstance(executed, list)
+    assert len(executed) > 0
+    assert "codex" not in str(interaction).lower()
+
+
+def test_workspace_runtime_failure_sends_error_message(monkeypatch):
+    monkeypatch.delenv("TELEGRAM_ALLOWED_CHAT_IDS", raising=False)
+    monkeypatch.setattr(telegram_bot, "_build_runner", lambda: _DummyRunner())
+    monkeypatch.setattr(telegram_bot, "_build_admin_orchestrator", lambda: _FailingAdmin())
+    monkeypatch.setattr(telegram_bot, "IntakeConductor", _DummyIntakeConductor)
+
+    bot = telegram_bot.TelegramBotRunner(token="token")
+    sent: list[tuple[int, str]] = []
+    bot._send_message = lambda chat_id, text: sent.append((chat_id, text))
+
+    bot._reply_with_agent(200, "/work inspect workspace")
+
+    assert sent, "Expected at least one Telegram reply"
+    assert "Workspace request failed due to a runtime error." in sent[-1][1]
+    assert "ollama connection refused" in sent[-1][1]
 
 
 def test_plan_command_with_bot_mention_starts_intake(monkeypatch):

@@ -2,8 +2,8 @@ id: trade_marketing
 name: Trade Marketing Agent
 description: Finds qualified industrial/commercial pressure-washing leads across Nanaimo-Mill Bay and adjacent Cowichan communities.
 llm:
-   provider: ollama
-   model: mistral:latest
+   provider: openai
+   model: gpt-4.1-mini
 behavior:
   system_prompt: |
     You are the marketing operations agent for Rocket Wash (owner + 1 employee).

@@ -287,7 +287,7 @@ class TelegramBotRunner:
         # Support Telegram deep-link command text rendered as markdown in some clients,
         # e.g. "[/work](tg://bot_command?command=work) list files".
         markdown_link = re.match(
-            r"^\[(/[^\]\s]+)\]\(tg://bot_command\?command=([^\)\s]+)\)\s*(.*)$",
+            r"^\[(/[^\]\s]+)\]\(tg://bot_command\?command=([^\)\s]+)\)\s*([\s\S]*)$",
             cleaned,
             flags=re.IGNORECASE,
         )
@@ -297,7 +297,7 @@ class TelegramBotRunner:
             return deep_link_command, payload
 
         plain_deep_link = re.match(
-            r"^tg://bot_command\?command=([^\s]+)\s*(.*)$",
+            r"^tg://bot_command\?command=([^\s]+)\s*([\s\S]*)$",
             cleaned,
             flags=re.IGNORECASE,
         )
@@ -321,9 +321,24 @@ class TelegramBotRunner:
             if cleaned:
                 self._send_message(chat_id, cleaned)
 
+    def _send_runtime_error(self, chat_id: int, error: Exception) -> None:
+        details = str(error).strip() or error.__class__.__name__
+        safe_text = (
+            "Workspace request failed due to a runtime error. "
+            f"Details: {details[:280]}"
+        )
+        try:
+            self._send_message(chat_id, safe_text)
+        except Exception:
+            # If Telegram send itself fails, let polling continue without crashing.
+            pass
+
     def _handle_workspace_message(self, chat_id: int, text: str) -> None:
-        replies = self.admin.handle_message(chat_id=chat_id, text=text)
-        self._send_messages(chat_id, replies)
+        try:
+            replies = self.admin.handle_message(chat_id=chat_id, text=text)
+            self._send_messages(chat_id, replies)
+        except Exception as exc:
+            self._send_runtime_error(chat_id, exc)
 
     def _handle_file_upload(self, chat_id: int, message: dict) -> None:
         try:

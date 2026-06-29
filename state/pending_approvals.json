@@ -72,10 +72,10 @@
         ]
       },
       "rationale": "Functional production code change requests require explicit owner approval.",
-      "status": "pending",
+      "status": "executed",
       "created_at": "2026-06-03T19:46:57.828857+00:00",
-      "updated_at": "2026-06-03T19:46:57.828857+00:00",
-      "decision_reason": ""
+      "updated_at": "2026-06-29T16:46:25.627781+00:00",
+      "decision_reason": "Approved by owner"
     },
     {
       "approval_id": "apr-20260603-194729-483257",

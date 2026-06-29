@@ -27,6 +27,14 @@ class TaskRegistry:
     BASE_TOOLS = ["list_files", "read_file", "search_text", "check_capability"]
     TRUSTED_LOCAL_TOOLS = ["install_python_packages", "scaffold_tool", "execute_python"]
 
+    _INSPECTION_TOOL_NAMES = ("list_files", "read_file", "search_text")
+    _READ_ONLY_INSPECTION_HINTS = (
+        "read-only",
+        "read only",
+        "inspection",
+        "inspect",
+    )
+
     def __init__(self) -> None:
         self.tools: dict[str, ToolDefinition] = {
             "list_files": ToolDefinition(
@@ -223,6 +231,16 @@ class TaskRegistry:
                 requires_confirmation=True,
             )
 
+        if self._is_workspace_inspection_request(text):
+            return TaskRoute(
+                task_type="workspace_inspection",
+                summary="Read or search the workspace without mutating it.",
+                recommended_agent="none",
+                allowed_tools=["list_files", "read_file", "search_text"],
+                requires_supervisor=False,
+                requires_confirmation=False,
+            )
+
         cad_related = any(
             token in text
             for token in (
@@ -346,7 +364,7 @@ class TaskRegistry:
 
         if any(token in text for token in ("read", "search", "find", "inspect", "show me", "status", "runs", "memory", "list")):
             return TaskRoute(
-                task_type="inspection",
+                task_type="workspace_inspection",
                 summary="Read or search the workspace without mutating it.",
                 recommended_agent="none",
                 allowed_tools=["list_files", "read_file", "search_text"],
@@ -461,9 +479,9 @@ class TaskRegistry:
                 ],
                 requires_supervisor=True,
             )
-        if normalized == "inspection":
+        if normalized in {"workspace_inspection", "inspection"}:
             return TaskRoute(
-                task_type="inspection",
+                task_type="workspace_inspection",
                 summary="Read or search the workspace without mutating it.",
                 recommended_agent="none",
                 allowed_tools=["list_files", "read_file", "search_text"],
@@ -471,6 +489,27 @@ class TaskRegistry:
         if normalized in {"general", "status", "cad_rnd"}:
             return self.route_for(normalized)
         return self.route_for(normalized)
+
+    def route_for_task_type(self, task_type: str) -> TaskRoute:
+        return self._route_for_task_type(task_type)
+
+    def _is_workspace_inspection_request(self, lowered_text: str) -> bool:
+        text = (lowered_text or "").strip()
+        if not text:
+            return False
+
+        owner_prefix = text.split("--- tool results", 1)[0]
+
+        if any(hint in owner_prefix for hint in self._READ_ONLY_INSPECTION_HINTS):
+            return True
+
+        # Explicit owner tool constraints should force read-only inspection routing.
+        if not any(marker in owner_prefix for marker in ("use", "only", "named", "tools")):
+            return False
+        for tool_name in self._INSPECTION_TOOL_NAMES:
+            if re.search(rf"\b{re.escape(tool_name)}\b", owner_prefix):
+                return True
+        return False
 
     def allowed_tools_for(self, task_type: str) -> list[str]:
         route = self._route_for_task_type(task_type)
