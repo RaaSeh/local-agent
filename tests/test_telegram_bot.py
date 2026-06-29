@@ -264,7 +264,7 @@ def test_work_multiline_payload_forces_workspace_inspection_and_blocks_delegatio
     interactions_path = tmp_path / "state" / "interactions.jsonl"
     assert interactions_path.exists(), "Expected interaction evidence to be written"
     interaction = json.loads(interactions_path.read_text(encoding="utf-8").splitlines()[-1])
-    assert interaction.get("selected_agent") == "admin"
+    assert interaction.get("selected_agent") == "none"
     executed = interaction.get("evidence", {}).get("executed_tool_calls", [])
     assert isinstance(executed, list)
     assert len(executed) > 0

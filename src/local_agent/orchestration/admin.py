@@ -57,7 +57,7 @@ class AdminOrchestrator:
         )
         self.supervisor = None
 
-    def handle_message(self, chat_id: int, text: str) -> list[str]:
+    def handle_message(self, chat_id: int, text: str, supervisor_replan_depth: int = 0) -> list[str]:
         cleaned = (text or "").strip()
         if not cleaned:
             return ["Send a message, /agents, /memory, or /status."]
@@ -113,10 +113,6 @@ class AdminOrchestrator:
         if memory_kind not in ("none", "") and cleaned:
             memory_updates.append({"kind": memory_kind, "value": cleaned[:400], "source": "owner"})
         self.memory.apply_updates(memory_updates)
-
-        # If no delegate_prompt was provided, use the owner's full message.
-        if not plan.get("delegate_prompt"):
-            plan["delegate_prompt"] = cleaned
 
         messages: list[str] = []
         status_update = str(plan.get("status_update", "")).strip()
@@ -177,6 +173,17 @@ class AdminOrchestrator:
         selected_agent = self._resolve_selected_agent(str(plan.get("selected_agent", "none")).strip(), agent_map)
         plan["selected_agent"] = selected_agent
 
+        if (
+            selected_agent in ("none", "")
+            and str(plan.get("task_type", "")).strip().lower() == "workspace_edit"
+            and str(plan.get("delegate_prompt", "")).strip()
+            and not self._has_mutating_tool_results(tool_results)
+        ):
+            fallback_delegate = self._pick_delegate_agent(agent_map)
+            if fallback_delegate != "none":
+                selected_agent = fallback_delegate
+                plan["selected_agent"] = fallback_delegate
+
         # When tools ran but failed and the planner didn't escalate on its own,
         # route to a repair delegate (codex preferred) for diagnosis and a concrete fix.
         if selected_agent in ("none", "") and tool_results:
@@ -197,6 +204,8 @@ class AdminOrchestrator:
                     messages.append(f"[Tool failures detected — escalated to {repair_agent_id} for diagnosis]")
 
         if selected_agent and selected_agent != "none":
+            if not str(plan.get("delegate_prompt", "")).strip():
+                plan["delegate_prompt"] = cleaned
             agent_cfg = agent_map.get(selected_agent)
             if not agent_cfg:
                 messages.append(f"Admin routing failed: unknown agent '{selected_agent}'.")
@@ -324,6 +333,32 @@ class AdminOrchestrator:
                 if review_record.get("corrections"):
                     supervisor_output = self._format_supervisor_feedback(review_record)
                 messages.append(digest_md)
+                approve_flag = review_record.get("approve")
+                has_retry_guidance = bool(review_record.get("corrections") or review_record.get("next_actions"))
+                if approve_flag is False and has_retry_guidance:
+                    if supervisor_replan_depth >= self._MAX_TOOL_ITERATIONS - 1:
+                        messages.append(
+                            f"I could not satisfy the supervisor after {self._MAX_TOOL_ITERATIONS} attempts: "
+                            f"{review_record.get('summary', '').strip() or 'Supervisor rejected the plan.'}"
+                        )
+                        return messages
+
+                    replan_message = self._build_supervisor_replan_message(
+                        owner_message=cleaned,
+                        plan=plan,
+                        tool_results=tool_results,
+                        delegate_output=delegate_output,
+                        review_record=review_record,
+                        attempt=supervisor_replan_depth + 1,
+                    )
+                    messages.append(
+                        "Supervisor rejected the current plan; re-planning with the supplied corrections."
+                    )
+                    return self.handle_message(
+                        chat_id=chat_id,
+                        text=replan_message,
+                        supervisor_replan_depth=supervisor_replan_depth + 1,
+                    )
 
         final_reply = self._synthesize_reply(
             owner_message=cleaned,
@@ -414,6 +449,37 @@ class AdminOrchestrator:
                     return fallback
             return "none"
         return "none"
+
+    @staticmethod
+    def _pick_delegate_agent(agent_map: dict[str, dict]) -> str:
+        for preferred in ("codex", "software_dev"):
+            if preferred in agent_map:
+                return preferred
+        for agent_id in sorted(agent_map):
+            if agent_id not in {"admin", "supervisor"}:
+                return agent_id
+        return "none"
+
+    @staticmethod
+    def _has_mutating_tool_results(tool_results: list[dict]) -> bool:
+        mutating_tools = {
+            "write_file",
+            "replace_text",
+            "append_file",
+            "make_directory",
+            "delete_file",
+            "rename_path",
+            "run_command",
+            "execute_python",
+            "install_python_packages",
+            "scaffold_tool",
+            "launch_executable",
+            "download_file",
+        }
+        return any(
+            bool(result.get("ok")) and str(result.get("tool", "")).strip() in mutating_tools
+            for result in tool_results
+        )
 
     def _format_agent_list(self) -> str:
         lines = ["Available agents:"]
@@ -527,6 +593,8 @@ class AdminOrchestrator:
         accumulated_context = owner_message
         recovery_attempts = 0
         self_modify_guard_applied = False
+        supervisor_retry_mode = "supervisor re-plan attempt" in owner_message.lower()
+        supervisor_retry_grounded = False
 
         for _iteration in range(self._MAX_TOOL_ITERATIONS):
             calls = plan.get("tool_calls") or []
@@ -596,6 +664,12 @@ class AdminOrchestrator:
                 "\n\nBased on the above results, produce an updated plan JSON. "
                 "If no further tools are needed, set tool_calls to [] and choose a selected_agent or provide a direct reply."
             )
+
+            if supervisor_retry_mode and not supervisor_retry_grounded:
+                accumulated_context += (
+                    "\n\nSupervisor retry verification complete; the next plan may delegate after grounding."
+                )
+                supervisor_retry_grounded = True
 
             if execution_intent and has_failed_tools:
                 accumulated_context += (
@@ -935,7 +1009,7 @@ class AdminOrchestrator:
             return []
         return self._handle_approve_command(chat_id=chat_id, command_text=f"/approve {approval_id}")
 
-    def _handle_approve_command(self, chat_id: int, command_text: str) -> list[str]:
+    def _handle_approve_command(self, chat_id: int, command_text: str, supervisor_replan_depth: int = 0) -> list[str]:
         parts = command_text.split(maxsplit=2)
         if len(parts) < 2:
             return ["Usage: /approve <approval_id>"]
@@ -956,6 +1030,7 @@ class AdminOrchestrator:
         delegate_output = ""
         supervisor_output = ""
         delegate_requires_input = False
+        supervisor_replan_message = ""
         selected_agent = str(execution_plan.get("selected_agent", "none")).strip()
         if selected_agent in {"", "none", "admin"}:
             selected_agent = "none"
@@ -1011,12 +1086,43 @@ class AdminOrchestrator:
                     delegate_requires_input = True
                     delegate_output = self._format_delegate_gate_failure(delegate_plan, gate_missing)
                 elif delegate_plan.get("needs_supervisor"):
-                    supervisor_output = self._review_with_supervisor(
-                        agent_cfg=agent_cfg,
-                        owner_message=str(record.get("owner_message", "")).strip(),
-                        delegate_output=delegate_output,
-                    )
+                    supervisor_cfg = self._load_agents().get("supervisor")
+                    if supervisor_cfg:
+                        review_record, _ = ToolSupervisor(self.router, supervisor_cfg).review(
+                            owner_message=str(record.get("owner_message", "")).strip(),
+                            plan={"task_type": "delegated_work"},
+                            tool_results=tool_results,
+                            delegate_output=delegate_output,
+                            memory_context=self.memory.render_context(),
+                        )
+                        supervisor_output = str(review_record.get("summary", "")).strip()
+                        if review_record.get("corrections"):
+                            supervisor_output = self._format_supervisor_feedback(review_record)
+                        approve_flag = review_record.get("approve")
+                        has_retry_guidance = bool(review_record.get("corrections") or review_record.get("next_actions"))
+                        if approve_flag is False and has_retry_guidance:
+                            if supervisor_replan_depth >= self._MAX_TOOL_ITERATIONS - 1:
+                                delegate_requires_input = True
+                                supervisor_output = (
+                                    f"I could not satisfy the supervisor after {self._MAX_TOOL_ITERATIONS} attempts: "
+                                    f"{review_record.get('summary', '').strip() or 'Supervisor rejected the plan.'}"
+                                )
+                            else:
+                                supervisor_replan_message = self._build_supervisor_replan_message(
+                                    owner_message=str(record.get("owner_message", "")).strip(),
+                                    plan=execution_plan,
+                                    tool_results=tool_results,
+                                    delegate_output=delegate_output,
+                                    review_record=review_record,
+                                    attempt=supervisor_replan_depth + 1,
+                                )
         self.approvals.mark_executed(approval_id=approval_id)
+        if supervisor_replan_message:
+            return self.handle_message(
+                chat_id=chat_id,
+                text=supervisor_replan_message,
+                supervisor_replan_depth=supervisor_replan_depth + 1,
+            )
         owner_message = str(record.get("owner_message", "")).strip()
         route = self.registry.route_for(owner_message)
         evaluation = self._evaluate_completion(
@@ -1207,6 +1313,21 @@ class AdminOrchestrator:
         requires_confirmation = bool(plan.get("requires_confirmation"))
         failed_tools = any(not bool(result.get("ok")) for result in tool_results)
         require_mutating_tool_evidence = bool(plan.get("require_mutating_tool_evidence"))
+        mutating_tools = {
+            "write_file",
+            "replace_text",
+            "append_file",
+            "make_directory",
+            "delete_file",
+            "rename_path",
+            "run_command",
+            "execute_python",
+            "install_python_packages",
+            "scaffold_tool",
+            "launch_executable",
+            "download_file",
+        }
+        has_mutating_tool_evidence = any(tool in mutating_tools for tool in executed_tool_calls)
 
         if requires_user_input:
             if execution_intent and failed_tools:
@@ -1248,6 +1369,14 @@ class AdminOrchestrator:
             if not executed_tool_calls:
                 evidence["notes"].append("No executed tools recorded for execution-intent request.")
                 evidence["diagnostics"]["blocked_reason"] = "no_tool_calls_executed"
+                if str(task_type or "").strip().lower() == "workspace_edit":
+                    evidence["notes"].append("Workspace edit produced no write artifacts.")
+                    return {
+                        "status": "failed",
+                        "completion_reason": "missing_execution_evidence",
+                        "evidence": evidence,
+                        "execution_intent": True,
+                    }
                 return {
                     "status": "needs-input",
                     "completion_reason": "missing_execution_evidence",
@@ -1255,22 +1384,18 @@ class AdminOrchestrator:
                     "execution_intent": True,
                 }
 
-        if require_mutating_tool_evidence:
-            mutating_tools = {
-                "write_file",
-                "replace_text",
-                "append_file",
-                "make_directory",
-                "delete_file",
-                "rename_path",
-                "run_command",
-                "execute_python",
-                "install_python_packages",
-                "scaffold_tool",
-                "launch_executable",
-                "download_file",
+        if str(task_type or "").strip().lower() == "workspace_edit" and not has_mutating_tool_evidence:
+            evidence["notes"].append("Workspace edit request completed without mutating-tool execution evidence.")
+            evidence["diagnostics"]["blocked_reason"] = "missing_mutating_tool_evidence"
+            return {
+                "status": "failed",
+                "completion_reason": "missing_execution_evidence",
+                "evidence": evidence,
+                "execution_intent": execution_intent,
             }
-            if not any(tool in mutating_tools for tool in executed_tool_calls):
+
+        if require_mutating_tool_evidence:
+            if not has_mutating_tool_evidence:
                 evidence["notes"].append(
                     "Coding/workspace change request missing mutating-tool execution evidence."
                 )
@@ -1915,6 +2040,56 @@ class AdminOrchestrator:
             lines.append("Risks:")
             for item in risks[:5]:
                 lines.append(f"- {item}")
+        return "\n".join(lines)
+
+    def _build_supervisor_replan_message(
+        self,
+        owner_message: str,
+        plan: dict,
+        tool_results: list[dict],
+        delegate_output: str,
+        review_record: dict,
+        attempt: int,
+    ) -> str:
+        corrections = [str(item).strip() for item in (review_record.get("corrections") or []) if str(item).strip()]
+        next_actions = [str(item).strip() for item in (review_record.get("next_actions") or []) if str(item).strip()]
+
+        lines = [
+            owner_message,
+            "",
+            f"Supervisor re-plan attempt {attempt}:",
+            f"- approve: {bool(review_record.get('approve', False))}",
+            f"- summary: {str(review_record.get('summary', '')).strip() or 'Supervisor rejected the previous plan.'}",
+            "",
+            "Supervisor requires:",
+        ]
+        if corrections:
+            lines.extend(f"- {item}" for item in corrections[:5])
+        else:
+            lines.append("- Re-plan the task to satisfy the supervisor's corrections.")
+
+        if next_actions:
+            lines.append("Next actions:")
+            lines.extend(f"- {item}" for item in next_actions[:5])
+
+        lines.extend(
+            [
+                "",
+                "Re-plan with these items as hard constraints.",
+                "Do not reintroduce fabricated paths, and do not delegate before verification reads.",
+                "Use list_files before any scaffold, write, rename, or agent delegation for this request.",
+            ]
+        )
+
+        tool_summary = self._format_tool_results_verbose(tool_results)
+        if tool_summary.strip() and tool_summary.strip() != "No tool calls.":
+            lines.extend(["", "Previous tool results:", tool_summary])
+
+        if delegate_output.strip():
+            lines.extend(["", "Previous delegate output:", delegate_output])
+
+        plan_snapshot = json.dumps(plan, indent=2)
+        lines.extend(["", "Previous planner snapshot:", plan_snapshot])
         return "\n".join(lines)
 
     def _parse_json(self, raw: str) -> dict:

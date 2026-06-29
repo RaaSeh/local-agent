@@ -80,7 +80,17 @@ class DummyRouter:
                 "- none"
             )
         if model == "supervisor-model":
-            return "1) Summary\nApproved after review.\n2) Risks/Concerns\nLow.\n3) Next Actions\nProceed."
+            return json.dumps(
+                {
+                    "summary": "Approved after review.",
+                    "risks": [],
+                    "corrections": [],
+                    "approve": True,
+                    "next_actions": ["Proceed."],
+                    "tool_feedback": "",
+                    "task_feedback": "",
+                }
+            )
         raise AssertionError(f"Unexpected model {model}")
 
 
@@ -160,6 +170,32 @@ def test_tool_executor_runs_local_tools(tmp_path):
     assert results[0]["ok"] is True
     assert results[0]["output"] == "beta\ngamma"
     assert "sample.txt:3: gamma" in results[1]["output"]
+
+
+def test_search_text_skips_permission_errors_and_returns_matches(tmp_path: Path, monkeypatch):
+    blocked = tmp_path / "blocked.txt"
+    blocked.write_text("secret", encoding="utf-8")
+    readable = tmp_path / "readable.txt"
+    readable.write_text("needle\n", encoding="utf-8")
+
+    original_read_text = Path.read_text
+
+    def fake_read_text(self: Path, *args, **kwargs):
+        if self == blocked:
+            raise PermissionError("denied")
+        return original_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", fake_read_text)
+
+    executor = ToolExecutor(tmp_path)
+    results = executor.execute(
+        [
+            {"tool": "search_text", "path": ".", "query": "needle", "limit": 5},
+        ]
+    )
+
+    assert results[0]["ok"] is True
+    assert "readable.txt:1: needle" in results[0]["output"]
 
 
 def test_run_command_rejects_multiline_input(tmp_path: Path):
@@ -277,6 +313,301 @@ def test_planner_fallback_forces_desktop_execution_when_model_returns_general():
     assert plan["task_type"] == "desktop_execution"
     assert plan["selected_agent"] == "none"
     assert all(call.get("tool") != "launch_executable" for call in plan["tool_calls"])
+
+
+def test_planner_forces_verification_first_for_workspace_edit_requests():
+    class WorkspaceEditPlannerRouter:
+        def chat(self, provider: str, model: str, system: str, user: str, options: dict | None = None) -> str:
+            _ = provider, model, system, user, options
+            return json.dumps(
+                {
+                    "status_update": "Planning a scaffold.",
+                    "task_type": "workspace_edit",
+                    "selected_agent": "codex",
+                    "delegate_prompt": "Create the Wix-editing agent and empty toolbox.",
+                    "reply": "Planning.",
+                    "tool_calls": [{"tool": "scaffold_tool", "path": "agents/wix.yaml", "purpose": "create agent", "code": "x"}],
+                    "memory_updates": [],
+                    "needs_supervisor": True,
+                    "requires_user_input": False,
+                    "requires_confirmation": False,
+                    "rationale": "initial scaffold",
+                }
+            )
+
+    planner = ToolPlanner(
+        router=WorkspaceEditPlannerRouter(),
+        agent_cfg={
+            "llm": {"provider": "openai", "model": "admin-model", "options": {}},
+            "behavior": {"system_prompt": "You are admin."},
+        },
+        registry=TaskRegistry(),
+    )
+
+    plan = planner.plan(
+        owner_message="Add a Wix-editing agent and create an empty Wix API toolbox.",
+        memory_context="",
+        allowed_agents=["codex", "software_dev"],
+    )
+
+    assert plan["task_type"] == "workspace_edit"
+    assert plan["selected_agent"] == "none"
+    assert plan["requires_confirmation"] is True
+    assert plan["tool_calls"]
+    assert plan["tool_calls"][0]["tool"] == "list_files"
+
+
+def test_workspace_edit_contradiction_dispatches_delegate_after_verification(tmp_path: Path):
+    class ContradictoryWorkspaceEditRouter:
+        def __init__(self):
+            self.worker_calls = 0
+
+        def chat(self, provider: str, model: str, system: str, user: str, options: dict | None = None) -> str:
+            _ = provider, system, options
+            if model == "admin-model" and "Reply with ONLY a JSON object" in user:
+                if "--- Tool results" not in user:
+                    return json.dumps(
+                        {
+                            "status_update": "Inspect the workspace first.",
+                            "task_type": "workspace_edit",
+                            "selected_agent": "none",
+                            "delegate_prompt": "Add the Wix agent YAML and create the empty toolbox.",
+                            "reply": "Inspecting.",
+                            "tool_calls": [
+                                {"tool": "list_files", "path": ".", "limit": 10},
+                                {"tool": "read_file", "path": "agents/admin.yaml", "start_line": 1, "end_line": 40},
+                            ],
+                            "memory_updates": [],
+                            "needs_supervisor": False,
+                            "requires_user_input": False,
+                            "requires_confirmation": False,
+                        }
+                    )
+                return json.dumps(
+                    {
+                        "status_update": "Inspection complete.",
+                        "task_type": "workspace_edit",
+                        "selected_agent": "none",
+                        "delegate_prompt": "Add the Wix agent YAML and create the empty toolbox.",
+                        "reply": "Proceed.",
+                        "tool_calls": [],
+                        "memory_updates": [],
+                        "needs_supervisor": False,
+                        "requires_user_input": False,
+                        "requires_confirmation": False,
+                    }
+                )
+            if model == "worker-model":
+                self.worker_calls += 1
+                return (
+                    "1) Concrete Deliverables\n"
+                    "- Add the Wix agent YAML and empty toolbox\n\n"
+                    "2) Target Files/Modules\n"
+                    "- agents/wix.yaml\n"
+                    "- tools/wix_toolbox.py\n\n"
+                    "Changed Files\n"
+                    "- agents/wix.yaml\n"
+                    "- tools/wix_toolbox.py\n\n"
+                    "3) Patch\n"
+                    "```diff\n"
+                    "--- a/agents/wix.yaml\n"
+                    "+++ b/agents/wix.yaml\n"
+                    "@@\n"
+                    "+id: wix\n"
+                    "```\n\n"
+                    "4) Validation Command(s) and observed result\n"
+                    "- pytest -q\n"
+                    "- result: not run\n\n"
+                    "5) Blockers with exact missing inputs, if any\n"
+                    "- none"
+                )
+            return "Final response synthesized for Telegram."
+
+    agents_dir = tmp_path / "agents"
+    agents_dir.mkdir()
+    _write_agent(agents_dir / "admin.yaml", "admin", "Admin", "admin-model")
+    _write_agent(agents_dir / "codex.yaml", "codex", "Codex", "worker-model")
+
+    router = ContradictoryWorkspaceEditRouter()
+    orchestrator = AdminOrchestrator(
+        router=router,
+        workspace_root=tmp_path,
+        agents_dir="agents",
+        state_dir="state",
+        runs_dir="runs",
+    )
+
+    orchestrator.handle_message(chat_id=123, text="Add the Wix agent YAML and create the empty toolbox.")
+
+    interaction = _read_last_interaction(tmp_path)
+    assert router.worker_calls == 1
+    assert interaction["selected_agent"] == "codex"
+    assert interaction["status"] == "failed"
+    assert interaction["completion_reason"] == "missing_execution_evidence"
+
+
+def test_supervisor_reject_replans_and_grounds_before_delegation(tmp_path: Path):
+    class RejectThenApproveRouter:
+        def __init__(self):
+            self.planner_calls = 0
+            self.supervisor_calls = 0
+            self.user_prompts: list[str] = []
+
+        def chat(self, provider: str, model: str, system: str, user: str, options: dict | None = None) -> str:
+            _ = provider, system, options
+            if model == "admin-model" and "Reply with ONLY a JSON object" in user:
+                self.planner_calls += 1
+                self.user_prompts.append(user)
+                if self.planner_calls == 1:
+                    return json.dumps(
+                        {
+                            "status_update": "Start with a scaffold.",
+                            "task_type": "workspace_edit",
+                            "selected_agent": "codex",
+                            "delegate_prompt": "Create the Wix-editing agent and empty toolbox.",
+                            "reply": "Planning.",
+                            "tool_calls": [
+                                {"tool": "scaffold_tool", "path": "agents/wix.yaml", "purpose": "create agent", "code": "x"}
+                            ],
+                            "memory_kind": "none",
+                            "memory_updates": [],
+                            "needs_supervisor": True,
+                            "requires_user_input": False,
+                            "requires_confirmation": True,
+                            "rationale": "initial attempt",
+                        }
+                    )
+                if self.planner_calls == 2:
+                    return json.dumps(
+                        {
+                            "status_update": "Use the supervisor corrections.",
+                            "task_type": "workspace_edit",
+                            "selected_agent": "codex",
+                            "delegate_prompt": "Create the Wix-editing agent after verification.",
+                            "reply": "Replanning.",
+                            "tool_calls": [],
+                            "memory_kind": "none",
+                            "memory_updates": [],
+                            "needs_supervisor": True,
+                            "requires_user_input": False,
+                            "requires_confirmation": True,
+                            "rationale": "after reject",
+                        }
+                    )
+                if self.planner_calls >= 3:
+                    return json.dumps(
+                        {
+                            "status_update": "Verification complete.",
+                            "task_type": "workspace_edit",
+                            "selected_agent": "codex",
+                            "delegate_prompt": "Finalize the Wix-editing agent and empty toolbox.",
+                            "reply": "Proceeding.",
+                            "tool_calls": [],
+                            "memory_kind": "none",
+                            "memory_updates": [],
+                            "needs_supervisor": True,
+                            "requires_user_input": False,
+                            "requires_confirmation": True,
+                            "rationale": "post-grounding",
+                        }
+                    )
+
+            if model == "worker-model":
+                return (
+                    "1) Concrete Deliverables\n"
+                    "- Create the requested workspace artifact\n\n"
+                    "2) Target Files/Modules\n"
+                    "- agents/wix.yaml\n\n"
+                    "Changed Files\n"
+                    "- agents/wix.yaml\n\n"
+                    "3) Patch\n"
+                    "```diff\n"
+                    "--- a/agents/wix.yaml\n"
+                    "+++ b/agents/wix.yaml\n"
+                    "@@\n"
+                    "+id: wix_editing\n"
+                    "```\n\n"
+                    "4) Validation Command(s) and observed result\n"
+                    "- pytest -q\n"
+                    "- result: passed\n\n"
+                    "5) Blockers with exact missing inputs, if any\n"
+                    "- none"
+                )
+
+            if model == "supervisor-model":
+                self.supervisor_calls += 1
+                if self.supervisor_calls == 1:
+                    return json.dumps(
+                        {
+                            "summary": "Reject and replan.",
+                            "risks": ["fabricated paths"],
+                            "corrections": [
+                                "call list_files before any scaffold or delegation",
+                                "verify the real agents directory before creating files",
+                            ],
+                            "approve": False,
+                            "next_actions": ["run list_files", "read the existing agent config"],
+                            "tool_feedback": "",
+                            "task_feedback": "",
+                        }
+                    )
+                return json.dumps(
+                    {
+                        "summary": "Approved after verification.",
+                        "risks": [],
+                        "corrections": [],
+                        "approve": True,
+                        "next_actions": ["Proceed."],
+                        "tool_feedback": "",
+                        "task_feedback": "",
+                    }
+                )
+
+            return "Final response synthesized for Telegram."
+
+    agents_dir = tmp_path / "agents"
+    agents_dir.mkdir()
+    _write_agent(agents_dir / "admin.yaml", "admin", "Admin", "admin-model")
+    _write_agent(agents_dir / "codex.yaml", "codex", "Codex", "worker-model")
+    _write_agent(
+        agents_dir / "supervisor.yaml",
+        "supervisor",
+        "Supervisor",
+        "supervisor-model",
+        provider="anthropic",
+    )
+
+    orchestrator = AdminOrchestrator(
+        router=RejectThenApproveRouter(),
+        workspace_root=tmp_path,
+        agents_dir="agents",
+        state_dir="state",
+        runs_dir="runs",
+    )
+
+    call_log: list[list[str]] = []
+    original_execute = orchestrator.tools.execute
+
+    def recording_execute(calls):
+        call_log.append([str(call.get("tool", "")) for call in calls])
+        return original_execute(calls)
+
+    orchestrator.tools.execute = recording_execute  # type: ignore[assignment]
+
+    messages = orchestrator.handle_message(
+        chat_id=321,
+        text="Add a Wix-editing agent and create an empty Wix API toolbox.",
+    )
+
+    assert call_log, "Expected tool execution to occur"
+    assert call_log[0][0] == "list_files"
+    assert not any("No active task in progress" in message for message in messages)
+
+    planner_prompts = orchestrator.router.user_prompts
+    assert len(planner_prompts) >= 2
+    assert orchestrator.router.planner_calls >= 2
+    assert orchestrator.router.supervisor_calls >= 2
+    assert messages[-1] == "Final response synthesized for Telegram."
 
 
 def test_planner_fallback_infers_alibre_launch_without_explicit_exe_path():
@@ -959,6 +1290,36 @@ def test_direct_agent_execution_intent_not_auto_completed_without_proof(tmp_path
     assert interaction["completion_reason"] == "missing_execution_evidence"
     assert interaction["execution_intent"] is True
     assert interaction["evidence"].get("diagnostics", {}).get("blocked_reason") == "no_tool_calls_executed"
+
+
+def test_workspace_edit_without_write_artifacts_is_failed(tmp_path: Path):
+    agents_dir = tmp_path / "agents"
+    agents_dir.mkdir(exist_ok=True)
+    _write_agent(agents_dir / "admin.yaml", "admin", "Admin", "admin-model")
+
+    orchestrator = AdminOrchestrator(
+        router=DummyRouter(),
+        workspace_root=tmp_path,
+        agents_dir=agents_dir,
+        state_dir=tmp_path / "state",
+        runs_dir=tmp_path / "runs",
+    )
+
+    evaluation = orchestrator._evaluate_completion(
+        owner_message="Create a workspace edit artifact",
+        task_type="workspace_edit",
+        selected_agent="none",
+        tool_results=[
+            {"tool": "list_files", "ok": True, "output": "agents/admin.yaml"},
+            {"tool": "read_file", "ok": True, "output": "id: admin"},
+        ],
+        delegate_output="",
+        supervisor_output="",
+        plan={"requires_user_input": False, "requires_confirmation": False, "tool_calls": []},
+    )
+
+    assert evaluation["status"] == "failed"
+    assert evaluation["completion_reason"] == "missing_execution_evidence"
 
 
 def test_policy_allows_helper_actions_without_approval(tmp_path: Path):

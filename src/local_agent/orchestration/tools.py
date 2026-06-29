@@ -252,18 +252,28 @@ class ToolExecutor:
         query = str(call.get("query", "")).lower().strip()
         if not query:
             raise ValueError("search_text requires query")
+        if not root.exists():
+            raise FileNotFoundError(f"Path not found: {root}")
         matches: list[str] = []
-        for path in root.rglob("*"):
-            if not path.is_file():
-                continue
+
+        candidate_paths: list[Path] = []
+        if root.is_file():
+            candidate_paths.append(root)
+        else:
+            for dirpath, _, filenames in os.walk(root, onerror=lambda _exc: None):
+                for filename in filenames:
+                    candidate_paths.append(Path(dirpath) / filename)
+
+        for path in candidate_paths:
             try:
-                for idx, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
-                    if query in line.lower():
-                        matches.append(f"{path}:{idx}: {line.strip()}")
-                        if len(matches) >= int(call.get("limit", 20)):
-                            return "\n".join(matches)
-            except UnicodeDecodeError:
+                lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            except OSError:
                 continue
+            for idx, line in enumerate(lines, start=1):
+                if query in line.lower():
+                    matches.append(f"{path}:{idx}: {line.strip()}")
+                    if len(matches) >= int(call.get("limit", 20)):
+                        return "\n".join(matches)
         return "\n".join(matches) or "No matches"
 
     def _tool_execute_python(self, call: dict) -> str:

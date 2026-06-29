@@ -80,8 +80,9 @@ def test_fabricated_delegate_output_triggers_replan_and_not_owner_surface(tmp_pa
 
     planning_calls = {"count": 0, "contexts": []}
 
-    def _mock_plan_request(chat_id: int, owner_message: str) -> dict:
+    def _mock_plan_request(chat_id: int, owner_message: str, route_task_type: str | None = None) -> dict:
         _ = chat_id
+        _ = route_task_type
         planning_calls["count"] += 1
         planning_calls["contexts"].append(owner_message)
         if planning_calls["count"] == 1:

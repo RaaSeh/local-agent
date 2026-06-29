@@ -134,7 +134,7 @@ class ToolPlanner:
         parsed.setdefault("requires_user_input", False)
         parsed.setdefault("rationale", "")
         parsed.setdefault("tool_research", "")
-        parsed.setdefault("requires_confirmation", route_hint.requires_confirmation)
+        parsed["requires_confirmation"] = bool(route_hint.requires_confirmation or parsed.get("requires_confirmation"))
 
         if not isinstance(parsed.get("tool_calls"), list):
             parsed["tool_calls"] = []
@@ -196,8 +196,21 @@ class ToolPlanner:
         if not parsed.get("selected_agent"):
             parsed["selected_agent"] = route_hint.recommended_agent
 
+        if self._requires_verification_first_route(parsed["task_type"]) and not self._is_replan_context(owner_message):
+            if not self._starts_with_verification_tool(parsed["tool_calls"]):
+                parsed["tool_calls"] = self._verification_first_tool_calls(
+                    owner_message=owner_message,
+                    task_type=str(parsed["task_type"]),
+                )
+
         if self.registry.confirmation_required(parsed["task_type"], parsed["tool_calls"]):
             parsed["requires_confirmation"] = True
+
+        parsed = self._normalize_delegate_contract(
+            parsed=parsed,
+            owner_message=owner_message,
+            allowed_agents=allowed_agents,
+        )
 
         return parsed
 
@@ -314,6 +327,128 @@ class ToolPlanner:
         has_named_tool = any(name in owner_prefix for name in ("list_files", "read_file", "search_text"))
         has_directive = any(marker in owner_prefix for marker in ("use only", "use", "only"))
         return has_named_tool and has_directive
+
+    @staticmethod
+    def _requires_verification_first_route(task_type: str) -> bool:
+        return str(task_type or "").strip().lower() in {
+            "workspace_edit",
+            "tool_acquisition",
+            "environment",
+            "self_modify",
+            "code_support",
+        }
+
+    @staticmethod
+    def _starts_with_verification_tool(tool_calls: list[dict]) -> bool:
+        if not tool_calls:
+            return False
+        first_tool = str((tool_calls[0] or {}).get("tool", "")).strip().lower()
+        return first_tool in {"list_files", "read_file", "search_text", "check_capability"}
+
+    @staticmethod
+    def _is_replan_context(owner_message: str) -> bool:
+        lowered = (owner_message or "").lower()
+        if "supervisor retry verification complete" in lowered:
+            return True
+        if any(
+            marker in lowered
+            for marker in (
+                "supervisor re-plan attempt",
+                "supervisor requires:",
+            )
+        ):
+            return False
+        return any(
+            marker in lowered
+            for marker in (
+                "--- tool results",
+                "previous tool results",
+                "previous planner snapshot",
+            )
+        )
+
+    def _verification_first_tool_calls(self, owner_message: str, task_type: str) -> list[dict]:
+        calls: list[dict] = [{"tool": "list_files", "path": ".", "limit": 120}]
+        lowered = (owner_message or "").lower()
+
+        if any(token in lowered for token in ("search", "find", "locate", "agent", "yaml", "toolbox", "directory", "folder")):
+            query = "agent yaml"
+            if any(token in lowered for token in ("toolbox", "tool box")):
+                query = "toolbox"
+            elif "yaml" in lowered or "yml" in lowered:
+                query = "yaml"
+            calls.append({"tool": "search_text", "path": ".", "query": query, "limit": 25})
+
+        if str(task_type or "").strip().lower() in {"workspace_edit", "code_support", "self_modify"} and "agent" in lowered:
+            calls.append({"tool": "read_file", "path": "agents/admin.yaml", "start_line": 1, "end_line": 240})
+
+        return calls[:5]
+
+    def _normalize_delegate_contract(self, parsed: dict, owner_message: str, allowed_agents: list[str]) -> dict:
+        selected_agent = str(parsed.get("selected_agent", "")).strip().lower()
+        delegate_prompt = str(parsed.get("delegate_prompt", "")).strip()
+        if not delegate_prompt or selected_agent not in {"", "none", "admin"}:
+            return parsed
+
+        if self._has_mutating_tool_calls(parsed.get("tool_calls") or []):
+            logger.warning(
+                "Planner emitted delegate_prompt alongside direct mutating tool calls; clearing delegate_prompt"
+            )
+            parsed["delegate_prompt"] = ""
+            return parsed
+
+        if parsed.get("tool_calls"):
+            return parsed
+
+        delegate_agent = self._pick_delegate_agent(allowed_agents)
+        if delegate_agent == "none":
+            logger.warning(
+                "Planner emitted delegate_prompt with selected_agent=none but no delegate agent is available; clearing delegate_prompt"
+            )
+            parsed["delegate_prompt"] = ""
+            return parsed
+
+        logger.warning(
+            "Planner emitted delegate_prompt with selected_agent=none and no mutating tool calls; forcing delegation to %s",
+            delegate_agent,
+        )
+        parsed["selected_agent"] = delegate_agent
+        parsed["delegate_prompt"] = delegate_prompt or owner_message.strip()
+        parsed["tool_calls"] = []
+        return parsed
+
+    @staticmethod
+    def _has_mutating_tool_calls(tool_calls: list[dict]) -> bool:
+        mutating_tools = {
+            "write_file",
+            "replace_text",
+            "append_file",
+            "make_directory",
+            "delete_file",
+            "rename_path",
+            "run_command",
+            "execute_python",
+            "install_python_packages",
+            "scaffold_tool",
+            "launch_executable",
+            "download_file",
+        }
+        for call in tool_calls:
+            if str((call or {}).get("tool", "")).strip().lower() in mutating_tools:
+                return True
+        return False
+
+    @staticmethod
+    def _pick_delegate_agent(allowed_agents: list[str]) -> str:
+        normalized = [
+            str(agent).strip()
+            for agent in allowed_agents
+            if str(agent).strip() and str(agent).strip().lower() not in {"none", "admin"}
+        ]
+        for preferred in ("codex", "software_dev"):
+            if preferred in normalized:
+                return preferred
+        return normalized[0] if normalized else "none"
 
 
 def registry_to_json(route_hint) -> str:

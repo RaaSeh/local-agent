@@ -145,6 +145,40 @@ class TaskRegistry:
                 requires_confirmation=True,
             )
 
+        if any(token in text for token in ("create", "add", "make", "build", "scaffold", "set up", "setup", "modify", "edit")) and any(
+            re.search(pattern, text)
+            for pattern in (
+                r"\bagent(s)?\b",
+                r"\btool\s*box\b",
+                r"\byaml\b",
+                r"\bconfig\b",
+                r"\bdirectory\b",
+                r"\bfolder\b",
+                r"\bfile(s)?\b",
+                r"\bworkspace\b",
+                r"\bproject\b",
+            )
+        ):
+            return TaskRoute(
+                task_type="workspace_edit",
+                summary="Inspect and modify workspace files, agent configs, or directory structure.",
+                recommended_agent="none",
+                allowed_tools=[
+                    "list_files",
+                    "read_file",
+                    "search_text",
+                    "write_file",
+                    "replace_text",
+                    "append_file",
+                    "make_directory",
+                    "delete_file",
+                    "rename_path",
+                    "run_command",
+                ],
+                requires_supervisor=True,
+                requires_confirmation=True,
+            )
+
         desktop_target = any(token in text for token in ("desktop", ".exe", "executable", "desktop app", "alibre"))
         desktop_action = any(token in text for token in ("open", "launch", "start", "run", "execute"))
         if desktop_target and desktop_action:
