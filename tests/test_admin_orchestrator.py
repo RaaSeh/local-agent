@@ -492,6 +492,114 @@ def test_trusted_autonomy_auto_approves_safe_risky_tools(tmp_path: Path):
     assert any("execute_python" in message for message in messages)
 
 
+def test_should_auto_approve_trusted_install_python_packages(tmp_path: Path) -> None:
+    agents_dir = tmp_path / "agents"
+    agents_dir.mkdir()
+    _write_agent(agents_dir / "admin.yaml", "admin", "Admin", "admin-model")
+
+    orchestrator = AdminOrchestrator(
+        router=DummyRouter(),
+        workspace_root=tmp_path,
+        agents_dir="agents",
+        state_dir="state",
+        runs_dir="runs",
+    )
+    chat_id = 801
+    orchestrator.autonomy.set_mode(chat_id, "trusted")
+
+    approved = orchestrator._should_auto_approve(
+        chat_id=chat_id,
+        owner_message="Install pytest and ruff",
+        tool_calls=[{"tool": "install_python_packages", "packages": ["pytest", "ruff"]}],
+    )
+
+    assert approved is True
+
+
+def test_should_auto_approve_trusted_launch_executable_allowlist(tmp_path: Path) -> None:
+    agents_dir = tmp_path / "agents"
+    agents_dir.mkdir()
+    _write_agent(agents_dir / "admin.yaml", "admin", "Admin", "admin-model")
+
+    orchestrator = AdminOrchestrator(
+        router=DummyRouter(),
+        workspace_root=tmp_path,
+        agents_dir="agents",
+        state_dir="state",
+        runs_dir="runs",
+    )
+    chat_id = 802
+    orchestrator.autonomy.set_mode(chat_id, "trusted")
+
+    alibre_approved = orchestrator._should_auto_approve(
+        chat_id=chat_id,
+        owner_message="Launch Alibre",
+        tool_calls=[{"tool": "launch_executable", "path": "C:/Program Files/Alibre/Program/AlibreDesign.exe"}],
+    )
+    other_exe_approved = orchestrator._should_auto_approve(
+        chat_id=chat_id,
+        owner_message="Launch helper",
+        tool_calls=[{"tool": "launch_executable", "path": "C:/Tools/OtherTool.exe"}],
+    )
+
+    assert alibre_approved is True
+    assert other_exe_approved is False
+
+
+def test_should_auto_approve_trusted_rejects_delete_and_rename(tmp_path: Path) -> None:
+    agents_dir = tmp_path / "agents"
+    agents_dir.mkdir()
+    _write_agent(agents_dir / "admin.yaml", "admin", "Admin", "admin-model")
+
+    orchestrator = AdminOrchestrator(
+        router=DummyRouter(),
+        workspace_root=tmp_path,
+        agents_dir="agents",
+        state_dir="state",
+        runs_dir="runs",
+    )
+    chat_id = 803
+    orchestrator.autonomy.set_mode(chat_id, "trusted")
+
+    delete_approved = orchestrator._should_auto_approve(
+        chat_id=chat_id,
+        owner_message="Delete this file",
+        tool_calls=[{"tool": "delete_file", "path": "notes.txt"}],
+    )
+    rename_approved = orchestrator._should_auto_approve(
+        chat_id=chat_id,
+        owner_message="Rename this file",
+        tool_calls=[{"tool": "rename_path", "path": "a.txt", "target": "b.txt"}],
+    )
+
+    assert delete_approved is False
+    assert rename_approved is False
+
+
+def test_should_auto_approve_trusted_rejects_dangerous_run_command(tmp_path: Path) -> None:
+    agents_dir = tmp_path / "agents"
+    agents_dir.mkdir()
+    _write_agent(agents_dir / "admin.yaml", "admin", "Admin", "admin-model")
+
+    orchestrator = AdminOrchestrator(
+        router=DummyRouter(),
+        workspace_root=tmp_path,
+        agents_dir="agents",
+        state_dir="state",
+        runs_dir="runs",
+    )
+    chat_id = 804
+    orchestrator.autonomy.set_mode(chat_id, "trusted")
+
+    approved = orchestrator._should_auto_approve(
+        chat_id=chat_id,
+        owner_message="Clean workspace quickly",
+        tool_calls=[{"tool": "run_command", "command": "rm -rf ."}],
+    )
+
+    assert approved is False
+
+
 def test_manual_autonomy_allows_helper_tool_execution_without_approval(tmp_path: Path):
     class ToolRouteRouter(DummyRouter):
         def chat(self, provider: str, model: str, system: str, user: str, options: dict | None = None) -> str:

@@ -24,6 +24,9 @@ class TaskRoute:
 
 
 class TaskRegistry:
+    BASE_TOOLS = ["list_files", "read_file", "search_text", "check_capability"]
+    TRUSTED_LOCAL_TOOLS = ["install_python_packages", "scaffold_tool", "execute_python"]
+
     def __init__(self) -> None:
         self.tools: dict[str, ToolDefinition] = {
             "list_files": ToolDefinition(
@@ -198,6 +201,26 @@ class TaskRegistry:
                     "read_file",
                 ],
                 requires_supervisor=True,
+            )
+
+        if any(
+            token in text
+            for token in (
+                "your own code",
+                "modify yourself",
+                "self-modify",
+                "self modify",
+                "patch your",
+                "edit your code",
+            )
+        ):
+            return TaskRoute(
+                task_type="self_modify",
+                summary="Modify the orchestrator's own source with git checkpoint + test gating.",
+                recommended_agent="codex",
+                allowed_tools=["list_files", "read_file", "search_text", "replace_text", "write_file", "run_command"],
+                requires_supervisor=True,
+                requires_confirmation=True,
             )
 
         cad_related = any(
@@ -388,6 +411,15 @@ class TaskRegistry:
                 ],
                 requires_supervisor=True,
             )
+        if normalized == "self_modify":
+            return TaskRoute(
+                task_type="self_modify",
+                summary="Modify the orchestrator's own source with git checkpoint + test gating.",
+                recommended_agent="codex",
+                allowed_tools=["list_files", "read_file", "search_text", "replace_text", "write_file", "run_command"],
+                requires_supervisor=True,
+                requires_confirmation=True,
+            )
         if normalized == "workspace_edit":
             return TaskRoute(
                 task_type="workspace_edit",
@@ -444,9 +476,27 @@ class TaskRegistry:
         route = self._route_for_task_type(task_type)
         return route.allowed_tools
 
-    def render_tool_manifest(self, task_type: str) -> str:
+    def effective_allowed_tools(self, task_type: str, trusted: bool = False) -> list[str]:
         route = self._route_for_task_type(task_type)
-        tools = [self.tools[name] for name in route.allowed_tools if name in self.tools]
+        forbidden_auto_add = {"delete_file", "rename_path", "launch_executable", "download_file"}
+        ordered_names = list(route.allowed_tools)
+        ordered_names.extend(self.BASE_TOOLS)
+        if trusted:
+            ordered_names.extend(self.TRUSTED_LOCAL_TOOLS)
+
+        filtered: list[str] = []
+        for name in ordered_names:
+            if name not in self.tools:
+                continue
+            if name in forbidden_auto_add and name not in route.allowed_tools:
+                continue
+            if name not in filtered:
+                filtered.append(name)
+        return filtered
+
+    def render_tool_manifest(self, task_type: str, trusted: bool = False) -> str:
+        route = self._route_for_task_type(task_type)
+        tools = [self.tools[name] for name in self.effective_allowed_tools(task_type, trusted=trusted)]
         lines = [
             f"Task type: {route.task_type}",
             f"Summary: {route.summary}",
@@ -461,9 +511,8 @@ class TaskRegistry:
             lines.append(f"- {tool.name}: {tool.description} | args={args} | {risk}")
         return "\n".join(lines)
 
-    def filter_tool_calls(self, task_type: str, tool_calls: list[dict] | None) -> list[dict]:
-        route = self._route_for_task_type(task_type)
-        allowed = set(route.allowed_tools)
+    def filter_tool_calls(self, task_type: str, tool_calls: list[dict] | None, trusted: bool = False) -> list[dict]:
+        allowed = set(self.effective_allowed_tools(task_type, trusted=trusted))
         filtered: list[dict] = []
         for call in tool_calls or []:
             if not isinstance(call, dict):

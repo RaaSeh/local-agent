@@ -67,10 +67,11 @@ class ToolPlanner:
         owner_message: str,
         memory_context: str,
         allowed_agents: list[str],
+        trusted: bool = False,
     ) -> dict:
         resolved = resolve_agent_llm(self.agent_cfg, task_context=owner_message)
         route_hint = self.registry.route_for(owner_message)
-        allowed_tools = self.registry.render_tool_manifest(route_hint.task_type)
+        allowed_tools = self.registry.render_tool_manifest(route_hint.task_type, trusted=trusted)
 
         system = (
             f"{resolved['system']}\n\n"
@@ -134,7 +135,11 @@ class ToolPlanner:
         if route_hint.task_type in fallback_route and parsed_task_type not in fallback_route:
             parsed["task_type"] = route_hint.task_type
 
-        parsed["tool_calls"] = self.registry.filter_tool_calls(parsed["task_type"], parsed["tool_calls"])
+        parsed["tool_calls"] = self.registry.filter_tool_calls(
+            parsed["task_type"],
+            parsed["tool_calls"],
+            trusted=trusted,
+        )
 
         if parsed.get("task_type") in fallback_route:
             parsed["selected_agent"] = "none"
@@ -143,7 +148,11 @@ class ToolPlanner:
                     owner_message=owner_message,
                     task_type=str(parsed.get("task_type", "")),
                 )
-                parsed["tool_calls"] = self.registry.filter_tool_calls(parsed["task_type"], parsed["tool_calls"])
+                parsed["tool_calls"] = self.registry.filter_tool_calls(
+                    parsed["task_type"],
+                    parsed["tool_calls"],
+                    trusted=trusted,
+                )
 
         # For inspection/general tasks the LLM sometimes skips tool_calls entirely.
         # Infer list_files directly so desktop-relative paths are always resolved.
@@ -153,7 +162,11 @@ class ToolPlanner:
                 task_type=str(parsed.get("task_type", "")),
             )
             if inferred:
-                parsed["tool_calls"] = self.registry.filter_tool_calls(parsed["task_type"], inferred)
+                parsed["tool_calls"] = self.registry.filter_tool_calls(
+                    parsed["task_type"],
+                    inferred,
+                    trusted=trusted,
+                )
 
         if not parsed.get("selected_agent"):
             parsed["selected_agent"] = route_hint.recommended_agent

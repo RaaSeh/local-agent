@@ -484,11 +484,16 @@ class AdminOrchestrator:
         all_tool_results: list[dict] = []
         accumulated_context = owner_message
         recovery_attempts = 0
+        self_modify_guard_applied = False
 
         for _iteration in range(self._MAX_TOOL_ITERATIONS):
             calls = plan.get("tool_calls") or []
             if not calls:
                 break  # Nothing more to run
+
+            if str(plan.get("task_type", "")).strip().lower() == "self_modify" and not self_modify_guard_applied:
+                calls = [*self._self_modify_guard_calls(), *calls]
+                self_modify_guard_applied = True
 
             needs_approval = self.policy.tool_calls_require_approval(calls)
             if needs_approval.requires_approval:
@@ -593,12 +598,30 @@ class AdminOrchestrator:
         if message_policy.requires_approval:
             return False
 
-        blocked_tools = {"delete_file", "rename_path", "download_file", "launch_executable"}
+        always_blocked = {"delete_file", "rename_path"}
+        allowed_launch_basenames = {"alibredesign.exe", "alibre design.exe"}
         for call in tool_calls:
             tool_name = str(call.get("tool", "")).strip().lower()
-            if tool_name in blocked_tools:
+            if tool_name in always_blocked:
+                return False
+            if tool_name == "launch_executable":
+                resolved_name = Path(str(call.get("path", "")).strip()).name.strip().lower()
+                if resolved_name not in allowed_launch_basenames:
+                    return False
+            if tool_name == "run_command" and self.policy.classify_tool_call(call).requires_approval:
                 return False
         return True
+
+    def _self_modify_guard_calls(self) -> list[dict]:
+        # Self-modify flows start with a deterministic git checkpoint before edits.
+        # The execution loop should run `pytest -q` after edits and revert via git if tests fail.
+        return [
+            {
+                "tool": "run_command",
+                "command": 'git add -A && git commit -m "chad-self-modify checkpoint" --allow-empty',
+                "timeout": 60,
+            }
+        ]
 
     def _is_code_patch_request(self, owner_message: str) -> bool:
         lowered = (owner_message or "").strip().lower()
@@ -817,10 +840,12 @@ class AdminOrchestrator:
             f"Retrieval context:\n{retrieval_context}\n\n"
             f"{self.memory.render_conversation_thread(limit=8)}"
         )
+        trusted = self.autonomy.get_mode(chat_id) == "trusted"
         return self.planner.plan(
             owner_message=owner_message,
             memory_context=enriched_memory_context,
             allowed_agents=worker_ids,
+            trusted=trusted,
         )
 
     def _render_pending_approvals(self, chat_id: int) -> str:
