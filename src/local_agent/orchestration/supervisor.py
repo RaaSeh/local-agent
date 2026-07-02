@@ -1,33 +1,44 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
 from dataclasses import dataclass
 
 from local_agent.core.run_once import resolve_agent_llm
+from local_agent.orchestration.parse_utils import PlanParseError, extract_json_candidate
+
+
+logger = logging.getLogger(__name__)
+
+_FAULT_INJECT_PARSE_FAILURE_FIRED = False
+
+
+def _maybe_force_parse_failure() -> None:
+    global _FAULT_INJECT_PARSE_FAILURE_FIRED
+    if _FAULT_INJECT_PARSE_FAILURE_FIRED:
+        return
+    if os.getenv("CHAD_FORCE_PARSE_FAILURE") != "1":
+        return
+    _FAULT_INJECT_PARSE_FAILURE_FIRED = True
+    logger.warning("[FAULT-INJECT] CHAD_FORCE_PARSE_FAILURE=1 forcing supervisor parse failure")
+    raise PlanParseError(
+        raw="<fault-injected malformed output>",
+        candidate="<fault-injected malformed output>",
+        source="fault-inject",
+    )
 
 
 def _parse_json(raw: str) -> dict:
-    candidate = (raw or "").strip()
-    if "```" in candidate:
-        start = candidate.find("```")
-        end = candidate.rfind("```")
-        if start != -1 and end > start:
-            candidate = candidate[start + 3 : end].strip()
-            if candidate.lower().startswith("json"):
-                candidate = candidate[4:].strip()
-
-    start = candidate.find("{")
-    end = candidate.rfind("}")
-    if start != -1 and end > start:
-        candidate = candidate[start : end + 1]
-
+    _maybe_force_parse_failure()
+    candidate = extract_json_candidate(raw)
     try:
         parsed = json.loads(candidate)
         if isinstance(parsed, dict):
             return parsed
-    except json.JSONDecodeError:
-        pass
-    return {}
+    except json.JSONDecodeError as exc:
+        raise PlanParseError(raw=raw or "", candidate=candidate) from exc
+    raise PlanParseError(raw=raw or "", candidate=candidate)
 
 
 @dataclass
@@ -74,7 +85,35 @@ class ToolSupervisor:
             user=user,
             options=resolved["options"],
         )
-        parsed = _parse_json(raw)
+        try:
+            parsed = _parse_json(raw)
+        except PlanParseError as exc:
+            summary = f"Run blocked: supervisor output could not be parsed. Raw snippet: {exc.preview()}"
+            return (
+                {
+                    "summary": summary,
+                    "risks": ["Malformed supervisor JSON output."],
+                    "corrections": ["Re-run the supervisor review with valid JSON output."],
+                    "approve": False,
+                    "next_actions": [],
+                    "tool_feedback": "",
+                    "task_feedback": "",
+                    "status": "blocked",
+                    "parse_error": True,
+                    "parse_error_source": exc.source,
+                    "parse_error_raw": exc.raw,
+                    "parse_error_snippet": exc.preview(),
+                },
+                "\n".join(
+                    [
+                        "## Supervisor Review",
+                        summary,
+                        "",
+                        "### Risks",
+                        "- Malformed supervisor JSON output.",
+                    ]
+                ),
+            )
         parsed.setdefault("summary", raw.strip())
         parsed.setdefault("risks", [])
         parsed.setdefault("corrections", [])

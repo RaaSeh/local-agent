@@ -5,6 +5,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
+RUN_STATUSES = {"queued", "running", "blocked", "completed", "failed"}
+
+
+def normalize_run_status(status: str | None) -> str:
+    normalized = str(status or "").strip().lower()
+    return normalized if normalized in RUN_STATUSES else "failed"
+
+
 def _utc_now_compact() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
 
