@@ -3,38 +3,41 @@ from __future__ import annotations
 import json
 import logging
 import re
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
 from local_agent.core.run_once import resolve_agent_llm
+from local_agent.orchestration.parse_utils import PlanParseError, extract_json_candidate
 from local_agent.orchestration.registry import TaskRegistry
 
 
 logger = logging.getLogger(__name__)
 
+_FAULT_INJECT_PARSE_FAILURE_FIRED = False
+
+
+def _maybe_force_parse_failure() -> None:
+    global _FAULT_INJECT_PARSE_FAILURE_FIRED
+    if _FAULT_INJECT_PARSE_FAILURE_FIRED:
+        return
+    if os.getenv("CHAD_FORCE_PARSE_FAILURE") != "1":
+        return
+    _FAULT_INJECT_PARSE_FAILURE_FIRED = True
+    logger.warning("[FAULT-INJECT] CHAD_FORCE_PARSE_FAILURE=1 forcing planner parse failure")
+    raise PlanParseError(raw="<fault-injected malformed output>", candidate="<fault-injected malformed output>", source="fault-inject")
+
 
 def _parse_json(raw: str) -> dict:
-    candidate = (raw or "").strip()
-    if "```" in candidate:
-        start = candidate.find("```")
-        end = candidate.rfind("```")
-        if start != -1 and end > start:
-            candidate = candidate[start + 3 : end].strip()
-            if candidate.lower().startswith("json"):
-                candidate = candidate[4:].strip()
-
-    start = candidate.find("{")
-    end = candidate.rfind("}")
-    if start != -1 and end > start:
-        candidate = candidate[start : end + 1]
-
+    _maybe_force_parse_failure()
+    candidate = extract_json_candidate(raw)
     try:
         parsed = json.loads(candidate)
         if isinstance(parsed, dict):
             return parsed
-    except json.JSONDecodeError:
-        pass
-    return {}
+    except json.JSONDecodeError as exc:
+        raise PlanParseError(raw=raw or "", candidate=candidate) from exc
+    raise PlanParseError(raw=raw or "", candidate=candidate)
 
 
 _KNOWN_PACKAGE_HINTS: dict[str, str] = {
@@ -120,7 +123,34 @@ class ToolPlanner:
             user=user,
             options=resolved["options"],
         )
-        parsed = _parse_json(raw)
+        try:
+            parsed = _parse_json(raw)
+        except PlanParseError as exc:
+            logger.warning("Planner returned malformed JSON: %s", exc.preview())
+            return {
+                "status_update": "Planner output could not be parsed.",
+                "selected_agent": "none",
+                "delegate_prompt": "",
+                "reply": (
+                    "Run blocked: planner returned malformed JSON. "
+                    f"Raw snippet: {exc.preview()}"
+                ),
+                "tool_calls": [],
+                "memory_kind": "none",
+                "memory_updates": [],
+                "needs_supervisor": False,
+                "requires_user_input": False,
+                "rationale": "Planner response could not be parsed.",
+                "tool_research": "",
+                "requires_confirmation": False,
+                "task_type": route_hint.task_type,
+                "status": "blocked",
+                "completion_reason": "planner_parse_failure",
+                "parse_error": True,
+                "parse_error_source": exc.source,
+                "parse_error_raw": exc.raw,
+                "parse_error_snippet": exc.preview(),
+            }
 
         parsed.setdefault("status_update", "")
         parsed["task_type"] = route_hint.task_type

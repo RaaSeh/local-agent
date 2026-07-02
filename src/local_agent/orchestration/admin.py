@@ -19,7 +19,7 @@ from local_agent.orchestration.supervisor import ToolSupervisor
 from local_agent.orchestration.tools import ToolExecutor
 from local_agent.policy.approvals import ApprovalStore, AutonomyProfileStore, PolicyEngine
 from local_agent.retrieval.simple_index import RetrievalIndex
-from local_agent.storage.runs import RunStore
+from local_agent.storage.runs import RunStore, normalize_run_status
 
 
 class AdminOrchestrator:
@@ -56,6 +56,28 @@ class AdminOrchestrator:
             state_dir=Path(state_dir) / "retrieval",
         )
         self.supervisor = None
+
+    def _save_admin_run(self, chat_id: int, user_message: str, status: str, summary: str, **extra: object) -> str:
+        payload = {
+            "workflow": "admin",
+            "chat_id": chat_id,
+            "goal": user_message,
+            "business_profile": "admin",
+            "status": normalize_run_status(status),
+            "final_memo": {"summary": summary},
+            **extra,
+        }
+        run_path = self.runs.save(workflow="admin", payload=payload)
+        self.runs.append_index(
+            {
+                "run_id": payload.get("run_id"),
+                "workflow": "admin",
+                "status": payload.get("status"),
+                "goal": user_message,
+                "path": str(run_path),
+            }
+        )
+        return str(run_path)
 
     def handle_message(self, chat_id: int, text: str, supervisor_replan_depth: int = 0) -> list[str]:
         cleaned = (text or "").strip()
@@ -106,6 +128,31 @@ class AdminOrchestrator:
         initial_route = self.registry.route_for(cleaned)
         route_task_type = initial_route.task_type
         plan = self._plan_request(chat_id=chat_id, owner_message=cleaned, route_task_type=route_task_type)
+        if plan.get("parse_error"):
+            blocked_summary = str(plan.get("reply", "Planner output could not be parsed.")).strip()
+            messages = [blocked_summary]
+            self.memory.append_interaction(
+                {
+                    "chat_id": chat_id,
+                    "user_message": cleaned,
+                    "selected_agent": "admin",
+                    "status": "blocked",
+                    "completion_reason": str(plan.get("completion_reason", "planner_parse_failure")),
+                    "summary": blocked_summary[:220],
+                    "parse_error_raw": plan.get("parse_error_raw", ""),
+                    "parse_error_snippet": plan.get("parse_error_snippet", ""),
+                }
+            )
+            self._save_admin_run(
+                chat_id=chat_id,
+                user_message=cleaned,
+                status=str(plan.get("status", "blocked")),
+                summary=blocked_summary,
+                completion_reason=str(plan.get("completion_reason", "planner_parse_failure")),
+                parse_error_raw=plan.get("parse_error_raw", ""),
+                parse_error_snippet=plan.get("parse_error_snippet", ""),
+            )
+            return messages
         # Apply any direct memory updates from plan, plus always record the
         # owner message so we can extract facts from it later via memory_kind.
         memory_updates = list(plan.get("memory_updates") or [])
@@ -163,6 +210,31 @@ class AdminOrchestrator:
             chat_id=chat_id,
             route_task_type=route_task_type,
         )
+        if plan.get("parse_error"):
+            blocked_summary = str(plan.get("reply", "Planner output could not be parsed.")).strip()
+            messages = [blocked_summary]
+            self.memory.append_interaction(
+                {
+                    "chat_id": chat_id,
+                    "user_message": cleaned,
+                    "selected_agent": "admin",
+                    "status": "blocked",
+                    "completion_reason": str(plan.get("completion_reason", "planner_parse_failure")),
+                    "summary": blocked_summary[:220],
+                    "parse_error_raw": plan.get("parse_error_raw", ""),
+                    "parse_error_snippet": plan.get("parse_error_snippet", ""),
+                }
+            )
+            self._save_admin_run(
+                chat_id=chat_id,
+                user_message=cleaned,
+                status=str(plan.get("status", "blocked")),
+                summary=blocked_summary,
+                completion_reason=str(plan.get("completion_reason", "planner_parse_failure")),
+                parse_error_raw=plan.get("parse_error_raw", ""),
+                parse_error_snippet=plan.get("parse_error_snippet", ""),
+            )
+            return messages
         if tool_results:
             messages.append(self._format_tool_feedback(tool_results))
         delegate_output = ""
@@ -229,6 +301,30 @@ class AdminOrchestrator:
                         owner_message=replanned_context,
                         route_task_type=route_task_type,
                     )
+                    if repaired_plan.get("parse_error"):
+                        blocked_summary = str(repaired_plan.get("reply", "Planner output could not be parsed.")).strip()
+                        self.memory.append_interaction(
+                            {
+                                "chat_id": chat_id,
+                                "user_message": cleaned,
+                                "selected_agent": "admin",
+                                "status": "blocked",
+                                "completion_reason": str(repaired_plan.get("completion_reason", "planner_parse_failure")),
+                                "summary": blocked_summary[:220],
+                                "parse_error_raw": repaired_plan.get("parse_error_raw", ""),
+                                "parse_error_snippet": repaired_plan.get("parse_error_snippet", ""),
+                            }
+                        )
+                        self._save_admin_run(
+                            chat_id=chat_id,
+                            user_message=cleaned,
+                            status=str(repaired_plan.get("status", "blocked")),
+                            summary=blocked_summary,
+                            completion_reason=str(repaired_plan.get("completion_reason", "planner_parse_failure")),
+                            parse_error_raw=repaired_plan.get("parse_error_raw", ""),
+                            parse_error_snippet=repaired_plan.get("parse_error_snippet", ""),
+                        )
+                        return [blocked_summary]
                     repaired_plan["selected_agent"] = "none"
                     repaired_plan["delegate_prompt"] = ""
                     repaired_plan, repaired_results = self._run_tool_loop(
@@ -320,7 +416,30 @@ class AdminOrchestrator:
                         delegate_output=delegate_output,
                     )
                     if bool(plan.get("needs_supervisor")):
-                        supervisor_output = self._review_with_supervisor(agent_cfg, cleaned, delegate_output)
+                        supervisor_output, review_failure = self._review_with_supervisor(agent_cfg, cleaned, delegate_output)
+                        if review_failure:
+                            self.memory.append_interaction(
+                                {
+                                    "chat_id": chat_id,
+                                    "user_message": cleaned,
+                                    "selected_agent": selected_agent,
+                                    "status": "blocked",
+                                    "completion_reason": "supervisor_parse_failure",
+                                    "summary": supervisor_output[:220],
+                                    "parse_error_raw": review_failure.get("parse_error_raw", ""),
+                                    "parse_error_snippet": review_failure.get("parse_error_snippet", ""),
+                                }
+                            )
+                            self._save_admin_run(
+                                chat_id=chat_id,
+                                user_message=cleaned,
+                                status="blocked",
+                                summary=supervisor_output,
+                                completion_reason="supervisor_parse_failure",
+                                parse_error_raw=review_failure.get("parse_error_raw", ""),
+                                parse_error_snippet=review_failure.get("parse_error_snippet", ""),
+                            )
+                            return [supervisor_output]
 
         if coding_brief_path:
             messages.append(f"Coding-agent brief: {coding_brief_path}")
@@ -340,6 +459,30 @@ class AdminOrchestrator:
                         f"{self.memory.render_conversation_thread(limit=8)}"
                     ),
                 )
+                if review_record.get("parse_error"):
+                    messages.append(digest_md)
+                    self.memory.append_interaction(
+                        {
+                            "chat_id": chat_id,
+                            "user_message": cleaned,
+                            "selected_agent": selected_agent or "admin",
+                            "status": "blocked",
+                            "completion_reason": "supervisor_parse_failure",
+                            "summary": str(review_record.get("summary", ""))[:220],
+                            "parse_error_raw": review_record.get("parse_error_raw", ""),
+                            "parse_error_snippet": review_record.get("parse_error_snippet", ""),
+                        }
+                    )
+                    self._save_admin_run(
+                        chat_id=chat_id,
+                        user_message=cleaned,
+                        status="blocked",
+                        summary=str(review_record.get("summary", "")),
+                        completion_reason="supervisor_parse_failure",
+                        parse_error_raw=review_record.get("parse_error_raw", ""),
+                        parse_error_snippet=review_record.get("parse_error_snippet", ""),
+                    )
+                    return messages
                 supervisor_output = str(review_record.get("summary", "")).strip()
                 if review_record.get("corrections"):
                     supervisor_output = self._format_supervisor_feedback(review_record)
@@ -406,6 +549,14 @@ class AdminOrchestrator:
                 "execution_intent": evaluation["execution_intent"],
                 "summary": final_reply[:220],
             }
+        )
+        self._save_admin_run(
+            chat_id=chat_id,
+            user_message=cleaned,
+            status=evaluation["status"],
+            summary=final_reply,
+            completion_reason=evaluation["completion_reason"],
+            selected_agent=selected_agent or "admin",
         )
         return messages
 
@@ -640,6 +791,8 @@ class AdminOrchestrator:
                         owner_message=accumulated_context,
                         route_task_type=route_task_type,
                     )
+                    if plan.get("parse_error"):
+                        return plan, all_tool_results
                     continue
 
                 record = self.approvals.add_pending(
@@ -707,6 +860,8 @@ class AdminOrchestrator:
                 owner_message=accumulated_context,
                 route_task_type=route_task_type,
             )
+            if plan.get("parse_error"):
+                return plan, all_tool_results
 
             if execution_intent and has_failed_tools:
                 plan["selected_agent"] = "none"
@@ -1121,6 +1276,30 @@ class AdminOrchestrator:
                             delegate_output=delegate_output,
                             memory_context=self.memory.render_context(),
                         )
+                        if review_record.get("parse_error"):
+                            parse_summary = str(review_record.get("summary", "")).strip()
+                            self.memory.append_interaction(
+                                {
+                                    "chat_id": chat_id,
+                                    "user_message": str(record.get("owner_message", "")).strip(),
+                                    "selected_agent": selected_agent,
+                                    "status": "blocked",
+                                    "completion_reason": "supervisor_parse_failure",
+                                    "summary": parse_summary[:220],
+                                    "parse_error_raw": review_record.get("parse_error_raw", ""),
+                                    "parse_error_snippet": review_record.get("parse_error_snippet", ""),
+                                }
+                            )
+                            self._save_admin_run(
+                                chat_id=chat_id,
+                                user_message=str(record.get("owner_message", "")).strip(),
+                                status="blocked",
+                                summary=parse_summary,
+                                completion_reason="supervisor_parse_failure",
+                                parse_error_raw=review_record.get("parse_error_raw", ""),
+                                parse_error_snippet=review_record.get("parse_error_snippet", ""),
+                            )
+                            return [parse_summary]
                         supervisor_output = str(review_record.get("summary", "")).strip()
                         if review_record.get("corrections"):
                             supervisor_output = self._format_supervisor_feedback(review_record)
@@ -2037,10 +2216,10 @@ class AdminOrchestrator:
             return ""
         return "\n".join(output) + "\n"
 
-    def _review_with_supervisor(self, agent_cfg: dict, owner_message: str, delegate_output: str) -> str:
+    def _review_with_supervisor(self, agent_cfg: dict, owner_message: str, delegate_output: str) -> tuple[str, dict | None]:
         supervisor_cfg = self._load_agents().get("supervisor")
         if not supervisor_cfg:
-            return ""
+            return "", None
         worker_record = {
             "agent_id": agent_cfg["id"],
             "agent_name": agent_cfg["name"],
@@ -2056,12 +2235,14 @@ class AdminOrchestrator:
             delegate_output=delegate_output,
             memory_context=self.memory.render_context(),
         )
+        if review_record.get("parse_error"):
+            return str(review_record.get("summary", "")).strip(), review_record
         supervisor_output = str(review_record.get("summary", "")).strip()
         if supervisor_output:
             self.memory.apply_updates(
                 [{"kind": "lesson", "value": supervisor_output[:300], "source": "supervisor"}]
             )
-        return supervisor_output
+        return supervisor_output, None
 
     def _synthesize_reply(
         self,
