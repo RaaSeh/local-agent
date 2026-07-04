@@ -125,6 +125,23 @@ class TaskRegistry:
                 arguments=["path", "args", "timeout"],
                 risky=True,
             ),
+            "wix_seo_audit": ToolDefinition(
+                name="wix_seo_audit",
+                description="Read-only SEO audit of Wix blog content; flags weak titles, meta, thin content, and missing slugs/structured data.",
+                arguments=["limit"],
+            ),
+            "wix_create_draft_post": ToolDefinition(
+                name="wix_create_draft_post",
+                description="Create a Wix blog DRAFT post (never published; a human publishes manually in the Wix dashboard).",
+                arguments=["draft_post"],
+                risky=True,
+            ),
+            "wix_update_draft_post": ToolDefinition(
+                name="wix_update_draft_post",
+                description="Update an existing Wix blog DRAFT post (stays a draft; never published).",
+                arguments=["draft_post_id", "draft_post"],
+                risky=True,
+            ),
         }
 
     def route_for(self, owner_message: str) -> TaskRoute:
@@ -135,6 +152,12 @@ class TaskRegistry:
                 task_type="status",
                 summary="Empty request; ask for clarification.",
             )
+
+        if any(
+            token in text
+            for token in ("wix", "seo audit", "blog draft", "draft post", "meta description")
+        ):
+            return self._wix_seo_route()
 
         if any(token in text for token in ("pdf", "export", "save this to pdf", "write this to pdf")):
             return TaskRoute(
@@ -411,8 +434,23 @@ class TaskRegistry:
             allowed_tools=["list_files", "read_file", "search_text"],
         )
 
+    def _wix_seo_route(self) -> TaskRoute:
+        return TaskRoute(
+            task_type="wix_seo",
+            summary="Audit Wix blog SEO and create/update blog DRAFTS (never publish).",
+            recommended_agent="none",
+            allowed_tools=[
+                "wix_seo_audit",
+                "wix_create_draft_post",
+                "wix_update_draft_post",
+            ],
+            requires_confirmation=True,
+        )
+
     def _route_for_task_type(self, task_type: str) -> TaskRoute:
         normalized = (task_type or "").strip().lower()
+        if normalized == "wix_seo":
+            return self._wix_seo_route()
         if normalized == "document_export":
             return TaskRoute(
                 task_type="document_export",
