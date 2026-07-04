@@ -125,6 +125,47 @@ class TaskRegistry:
                 arguments=["path", "args", "timeout"],
                 risky=True,
             ),
+            # --- Sanity multi-tenant CMS (Phase 1, draft-only) ---
+            # Every write below creates/updates a Sanity DRAFT (drafts.* _id) only.
+            # Publishing is a human action in Sanity Studio; there is no publish tool.
+            "provision_tenant": ToolDefinition(
+                name="provision_tenant",
+                description="Create a DRAFT Sanity 'tenant' document for a service business (draft-only, never publishes).",
+                arguments=["name", "subdomain_slug", "brand"],
+            ),
+            "draft_tenant_page": ToolDefinition(
+                name="draft_tenant_page",
+                description="Create a DRAFT Sanity 'page' document referencing a tenant, with SEO fields (draft-only).",
+                arguments=[
+                    "tenant_ref",
+                    "title",
+                    "body",
+                    "seo_title",
+                    "seo_description",
+                    "slug",
+                    "structured_data",
+                ],
+            ),
+            "update_tenant_page": ToolDefinition(
+                name="update_tenant_page",
+                description="Patch fields on an existing DRAFT Sanity page (draft id required, draft-only).",
+                arguments=["draft_page_id", "fields"],
+            ),
+            "list_tenants": ToolDefinition(
+                name="list_tenants",
+                description="Read-only GROQ query listing all Sanity tenant documents.",
+                arguments=[],
+            ),
+            "list_tenant_pages": ToolDefinition(
+                name="list_tenant_pages",
+                description="Read-only GROQ query listing pages for a tenant.",
+                arguments=["tenant_ref"],
+            ),
+            "seo_audit_tenant": ToolDefinition(
+                name="seo_audit_tenant",
+                description="Read-only SEO audit of a tenant's pages; flags weak/missing SEO and thin content.",
+                arguments=["tenant_ref"],
+            ),
         }
 
     def route_for(self, owner_message: str) -> TaskRoute:
@@ -134,6 +175,34 @@ class TaskRegistry:
             return TaskRoute(
                 task_type="status",
                 summary="Empty request; ask for clarification.",
+            )
+
+        if any(
+            token in text
+            for token in (
+                "tenant",
+                "sanity",
+                "subdomain",
+                "seo audit",
+                "draft page",
+                "provision",
+                "headless cms",
+            )
+        ):
+            return TaskRoute(
+                task_type="cms_provisioning",
+                summary="Provision tenants and draft pages/SEO in Sanity (draft-only; a human publishes).",
+                recommended_agent="none",
+                allowed_tools=[
+                    "provision_tenant",
+                    "draft_tenant_page",
+                    "update_tenant_page",
+                    "list_tenants",
+                    "list_tenant_pages",
+                    "seo_audit_tenant",
+                ],
+                requires_supervisor=True,
+                requires_confirmation=True,
             )
 
         if any(token in text for token in ("pdf", "export", "save this to pdf", "write this to pdf")):
@@ -413,6 +482,22 @@ class TaskRegistry:
 
     def _route_for_task_type(self, task_type: str) -> TaskRoute:
         normalized = (task_type or "").strip().lower()
+        if normalized == "cms_provisioning":
+            return TaskRoute(
+                task_type="cms_provisioning",
+                summary="Provision tenants and draft pages/SEO in Sanity (draft-only; a human publishes).",
+                recommended_agent="none",
+                allowed_tools=[
+                    "provision_tenant",
+                    "draft_tenant_page",
+                    "update_tenant_page",
+                    "list_tenants",
+                    "list_tenant_pages",
+                    "seo_audit_tenant",
+                ],
+                requires_supervisor=True,
+                requires_confirmation=True,
+            )
         if normalized == "document_export":
             return TaskRoute(
                 task_type="document_export",
