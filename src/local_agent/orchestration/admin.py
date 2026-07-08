@@ -37,11 +37,16 @@ class AdminOrchestrator:
         self.router = router
         self.workspace_root = Path(workspace_root).resolve()
         self.agents_dir = self.workspace_root / Path(agents_dir)
+        agent_map = self._load_agents()
+        admin_cfg = agent_map.get("admin", {})
         self.memory = MemoryStore(self.workspace_root / Path(state_dir))
         self.runs = RunStore(self.workspace_root / Path(runs_dir))
-        self.tools = ToolExecutor(self.workspace_root)
+        self.tools = ToolExecutor(
+            self.workspace_root,
+            max_tool_calls=self._parse_max_tool_calls(admin_cfg.get("max_tool_calls", 5)),
+        )
         self.registry = TaskRegistry()
-        self.planner = ToolPlanner(router=self.router, agent_cfg=self._load_agents().get("admin", {}), registry=self.registry)
+        self.planner = ToolPlanner(router=self.router, agent_cfg=admin_cfg, registry=self.registry)
         self.policy = PolicyEngine(self.workspace_root / "config" / "policy.yaml")
         self.approvals = ApprovalStore(self.workspace_root / Path(state_dir))
         self.autonomy = AutonomyProfileStore(self.workspace_root / Path(state_dir))
@@ -56,6 +61,14 @@ class AdminOrchestrator:
             state_dir=Path(state_dir) / "retrieval",
         )
         self.supervisor = None
+
+    @staticmethod
+    def _parse_max_tool_calls(raw_value: object) -> int:
+        try:
+            value = int(raw_value)
+        except (TypeError, ValueError):
+            value = 5
+        return max(1, min(value, 20))
 
     def _save_admin_run(self, chat_id: int, user_message: str, status: str, summary: str, **extra: object) -> str:
         payload = {
@@ -258,7 +271,11 @@ class AdminOrchestrator:
 
         # When tools ran but failed and the planner didn't escalate on its own,
         # route to a repair delegate (codex preferred) for diagnosis and a concrete fix.
-        if selected_agent in ("none", "") and tool_results:
+        if (
+            selected_agent in ("none", "")
+            and tool_results
+            and self._should_delegate_tool_failure_repair(str(plan.get("task_type", "")))
+        ):
             _failed_results = [r for r in tool_results if not r.get("ok")]
             _succeeded_results = [r for r in tool_results if r.get("ok")]
             if _failed_results and not _succeeded_results:
@@ -446,7 +463,15 @@ class AdminOrchestrator:
         if selected_agent and selected_agent != "none":
             messages.append(f"Delegate iterations: {delegate_iterations}")
 
-        if tool_results or delegate_output or supervisor_output:
+        _direct_tool_only_run = (
+            bool(tool_results)
+            and not delegate_output
+            and not supervisor_output
+            and (selected_agent in ("", "none", "admin"))
+        )
+        _route_requires_supervisor = self.registry.route_for(cleaned).requires_supervisor
+        _skip_supervisor = _direct_tool_only_run and not _route_requires_supervisor
+        if (tool_results or delegate_output or supervisor_output) and not _skip_supervisor:
             supervisor_cfg = self._load_agents().get("supervisor")
             if supervisor_cfg:
                 review_record, digest_md = ToolSupervisor(self.router, supervisor_cfg).review(
@@ -648,6 +673,19 @@ class AdminOrchestrator:
             for result in tool_results
         )
 
+    @staticmethod
+    def _should_delegate_tool_failure_repair(task_type: str) -> bool:
+        return str(task_type or "").strip().lower() not in {
+            "workspace_edit",
+            "tool_acquisition",
+            "environment",
+            "desktop_execution",
+            "document_export",
+            "workspace_inspection",
+            "inspection",
+            "general",
+        }
+
     def _format_agent_list(self) -> str:
         lines = ["Available agents:"]
         for agent_id, cfg in sorted(self._load_agents().items()):
@@ -811,7 +849,7 @@ class AdminOrchestrator:
                 plan["tool_calls"] = []
                 plan["requires_user_input"] = True
                 plan["reply"] = (
-                    f"Approval required before running risky tool calls. "
+                    f"Approval required before running workflow-changing tool calls. "
                     f"Use /approve {record['approval_id']} or /reject {record['approval_id']}"
                 )
                 break
@@ -897,14 +935,15 @@ class AdminOrchestrator:
         allowed_launch_basenames = {"alibredesign.exe", "alibre design.exe"}
         for call in tool_calls:
             tool_name = str(call.get("tool", "")).strip().lower()
+            tool_policy = self.policy.classify_tool_call(call)
+            if tool_policy.requires_approval:
+                return False
             if tool_name in always_blocked:
                 return False
             if tool_name == "launch_executable":
                 resolved_name = Path(str(call.get("path", "")).strip()).name.strip().lower()
                 if resolved_name not in allowed_launch_basenames:
                     return False
-            if tool_name == "run_command" and self.policy.classify_tool_call(call).requires_approval:
-                return False
         return True
 
     def _self_modify_guard_calls(self) -> list[dict]:
@@ -1373,6 +1412,15 @@ class AdminOrchestrator:
         ]
 
     def _build_approval_execution_plan(self, owner_message: str, plan: dict, include_tool_calls: bool = True) -> dict:
+        task_type = str(plan.get("task_type", "code_support") or "code_support")
+        planned_tool_calls = (
+            [call for call in (plan.get("tool_calls") or []) if isinstance(call, dict)]
+            if include_tool_calls
+            else []
+        )
+        direct_execution_task = task_type in self._EXECUTION_INTENT_TASK_TYPES
+        direct_mutating_plan = direct_execution_task and bool(planned_tool_calls)
+
         agent_map = self._load_agents()
         selected_agent = self._resolve_selected_agent(
             str(plan.get("selected_agent", "none")).strip(),
@@ -1380,23 +1428,16 @@ class AdminOrchestrator:
         )
         looks_like_code_patch = self._is_code_patch_request(owner_message)
         # Production code-change approvals should prefer hosted codex over local software_dev.
-        if selected_agent == "software_dev" and looks_like_code_patch:
+        if not direct_mutating_plan and selected_agent == "software_dev" and looks_like_code_patch:
             selected_agent = "codex" if "codex" in agent_map else "none"
-        if selected_agent in {"none", "admin", ""} and looks_like_code_patch:
+        if not direct_mutating_plan and selected_agent in {"none", "admin", ""} and looks_like_code_patch:
             if "codex" in agent_map:
                 selected_agent = "codex"
             else:
                 selected_agent = "none"
 
-        task_type = str(plan.get("task_type", "code_support") or "code_support")
-        if looks_like_code_patch:
+        if not direct_mutating_plan and looks_like_code_patch:
             task_type = "code_support"
-
-        planned_tool_calls = (
-            [call for call in (plan.get("tool_calls") or []) if isinstance(call, dict)]
-            if include_tool_calls
-            else []
-        )
 
         require_mutating_tool_evidence = task_type in {"code_support", "workspace_edit"}
         execution_intent_override = task_type in self._EXECUTION_INTENT_TASK_TYPES or require_mutating_tool_evidence

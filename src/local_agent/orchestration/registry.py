@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass, field
+from urllib.parse import urlparse
 
 
 @dataclass(frozen=True)
@@ -24,6 +26,7 @@ class TaskRoute:
 
 
 class TaskRegistry:
+    _DEFAULT_HTTP_ALLOWLIST = {"httpbin.org"}
     BASE_TOOLS = ["list_files", "read_file", "search_text", "check_capability"]
     TRUSTED_LOCAL_TOOLS = ["install_python_packages", "scaffold_tool", "execute_python"]
 
@@ -86,7 +89,11 @@ class TaskRegistry:
             ),
             "run_command": ToolDefinition(
                 name="run_command",
-                description="Run a shell command in the workspace.",
+                description=(
+                    "Run a local shell command in the workspace for local shell/file operations only. "
+                    "Do NOT use run_command with curl/wget/Invoke-WebRequest for HTTP. "
+                    "Network requests MUST use the http_request tool."
+                ),
                 arguments=["command", "cwd", "timeout"],
                 risky=True,
             ),
@@ -119,6 +126,16 @@ class TaskRegistry:
                 arguments=["url", "path"],
                 risky=True,
             ),
+            "http_request": ToolDefinition(
+                name="http_request",
+                description=(
+                    "Make an HTTPS API request. This is the REQUIRED tool for all network/HTTP calls "
+                    "(e.g. external APIs). method=GET|POST, url=HTTPS only, headers=dict, "
+                    "json_body=optional dict, timeout=default 30 seconds."
+                ),
+                arguments=["method", "url", "headers", "json_body", "timeout"],
+                risky=True,
+            ),
             "execute_python": ToolDefinition(
                 name="execute_python",
                 description="Run a .py script that exists in the workspace and return its stdout/stderr/exit code.",
@@ -145,6 +162,39 @@ class TaskRegistry:
                 requires_confirmation=True,
             )
 
+        # Explicit code-edit asks that mention concrete source files should route to
+        # code_support so the planner performs real mutations/delegation rather than
+        # stopping after read-only inspection.
+        has_edit_intent = any(token in text for token in ("edit", "modify", "add", "update", "patch"))
+        mentions_source_path = re.search(
+            r"\b[^\s]+\.(py|ts|tsx|js|jsx|java|go|rs|cpp|c|cs|rb|php|swift|kt|scala|md|yaml|yml|json|toml)\b",
+            text,
+        )
+        mentions_code_change = any(
+            token in text for token in ("docstring", "function", "method", "class", "def ", "return ", "import ")
+        )
+        if has_edit_intent and (mentions_source_path or mentions_code_change):
+            return TaskRoute(
+                task_type="code_support",
+                summary="Apply concrete code or file edits in the workspace.",
+                recommended_agent="codex",
+                allowed_tools=[
+                    "list_files",
+                    "read_file",
+                    "search_text",
+                    "write_file",
+                    "replace_text",
+                    "append_file",
+                    "make_directory",
+                    "run_command",
+                    "execute_python",
+                    "install_python_packages",
+                    "check_capability",
+                    "scaffold_tool",
+                ],
+                requires_supervisor=True,
+            )
+
         if any(token in text for token in ("create", "add", "make", "build", "scaffold", "set up", "setup", "modify", "edit")) and any(
             re.search(pattern, text)
             for pattern in (
@@ -159,6 +209,10 @@ class TaskRegistry:
                 r"\bproject\b",
             )
         ):
+            _has_destructive_tokens = any(
+                token in text
+                for token in ("delete", "remove", "overwrite", "rename", "move")
+            )
             return TaskRoute(
                 task_type="workspace_edit",
                 summary="Inspect and modify workspace files, agent configs, or directory structure.",
@@ -175,8 +229,8 @@ class TaskRegistry:
                     "rename_path",
                     "run_command",
                 ],
-                requires_supervisor=True,
-                requires_confirmation=True,
+                requires_supervisor=_has_destructive_tokens,
+                requires_confirmation=_has_destructive_tokens,
             )
 
         desktop_target = any(token in text for token in ("desktop", ".exe", "executable", "desktop app", "alibre"))
@@ -205,6 +259,17 @@ class TaskRegistry:
                 recommended_agent="none",
                 allowed_tools=["install_python_packages", "run_command", "read_file", "list_files", "check_capability"],
                 requires_supervisor=True,
+            )
+
+        if "https://" in text and (
+            "http_request" in text or re.search(r"\b(get|post)\b", text)
+        ):
+            return TaskRoute(
+                task_type="tool_acquisition",
+                summary="Execute an allowlisted HTTPS request directly with the built-in HTTP tool.",
+                recommended_agent="none",
+                allowed_tools=["http_request", "read_file", "list_files", "check_capability"],
+                requires_supervisor=False,
             )
 
         if any(
@@ -236,6 +301,7 @@ class TaskRegistry:
                     "install_python_packages",
                     "scaffold_tool",
                     "download_file",
+                    "http_request",
                     "execute_python",
                     "run_command",
                     "write_file",
@@ -455,6 +521,7 @@ class TaskRegistry:
                     "install_python_packages",
                     "scaffold_tool",
                     "download_file",
+                    "http_request",
                     "execute_python",
                     "run_command",
                     "write_file",
@@ -551,7 +618,7 @@ class TaskRegistry:
 
     def effective_allowed_tools(self, task_type: str, trusted: bool = False) -> list[str]:
         route = self._route_for_task_type(task_type)
-        forbidden_auto_add = {"delete_file", "rename_path", "launch_executable", "download_file"}
+        forbidden_auto_add = {"delete_file", "rename_path", "launch_executable", "download_file", "http_request"}
         ordered_names = list(route.allowed_tools)
         ordered_names.extend(self.BASE_TOOLS)
         if trusted:
@@ -603,9 +670,32 @@ class TaskRegistry:
             if not isinstance(call, dict):
                 continue
             tool_name = str(call.get("tool", "")).strip().lower()
-            if tool_name in {"delete_file", "rename_path", "run_command", "launch_executable", "install_python_packages"}:
+            if tool_name in {
+                "delete_file",
+                "rename_path",
+                "run_command",
+                "launch_executable",
+                "install_python_packages",
+            }:
+                return True
+            if tool_name == "http_request" and not self._is_low_risk_http_request(call):
                 return True
         return False
+
+    def _is_low_risk_http_request(self, call: dict) -> bool:
+        method = str(call.get("method", "GET")).strip().upper()
+        if method != "GET":
+            return False
+        target_url = str(call.get("url", "")).strip()
+        if not target_url.lower().startswith("https://"):
+            return False
+        host = (urlparse(target_url).hostname or "").strip().lower()
+        if not host:
+            return False
+        raw_allowlist = os.getenv("HTTP_TOOL_ALLOWLIST", "")
+        allowlist = {item.strip().lower() for item in raw_allowlist.split(",") if item.strip()}
+        allowlist |= self._DEFAULT_HTTP_ALLOWLIST
+        return host in allowlist
 
     def to_json(self, task_type: str) -> str:
         route = self._route_for_task_type(task_type)

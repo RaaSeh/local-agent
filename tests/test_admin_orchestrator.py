@@ -256,6 +256,159 @@ def test_planner_fallback_prefers_direct_tools_for_install_requests():
     assert any(call.get("tool") == "install_python_packages" for call in plan["tool_calls"])
 
 
+def test_planner_fallback_creates_numbered_text_files_without_delegation():
+    class EmptyPlannerRouter:
+        def chat(self, provider: str, model: str, system: str, user: str, options: dict | None = None) -> str:
+            _ = provider, model, system, user, options
+            return "{}"
+
+    planner = ToolPlanner(
+        router=EmptyPlannerRouter(),
+        agent_cfg={
+            "llm": {"provider": "openai", "model": "admin-model", "options": {}},
+            "behavior": {"system_prompt": "You are admin."},
+        },
+        registry=TaskRegistry(),
+    )
+
+    first_plan = planner.plan(
+        owner_message="In the workspace, create 6 text files lead_01.txt...lead_06.txt",
+        memory_context="",
+        allowed_agents=["codex", "software_dev"],
+    )
+
+    assert first_plan["task_type"] == "workspace_edit"
+    assert first_plan["selected_agent"] == "none"
+    assert len(first_plan["tool_calls"]) == 5
+    assert all(call.get("tool") == "write_file" for call in first_plan["tool_calls"])
+    assert first_plan["tool_calls"][0]["path"] == "lead_01.txt"
+    assert first_plan["tool_calls"][-1]["path"] == "lead_05.txt"
+
+    second_plan = planner.plan(
+        owner_message=(
+            "In the workspace, create 6 text files lead_01.txt...lead_06.txt\n\n"
+            "--- Tool results (iteration 1) ---\n"
+            "[ok] write_file: Wrote C:/tmp/lead_01.txt\n"
+            "[ok] write_file: Wrote C:/tmp/lead_02.txt\n"
+            "[ok] write_file: Wrote C:/tmp/lead_03.txt\n"
+            "[ok] write_file: Wrote C:/tmp/lead_04.txt\n"
+            "[ok] write_file: Wrote C:/tmp/lead_05.txt"
+        ),
+        memory_context="",
+        allowed_agents=["codex", "software_dev"],
+    )
+
+    assert second_plan["selected_agent"] == "none"
+    assert second_plan["tool_calls"] == [{"tool": "write_file", "path": "lead_06.txt", "content": ""}]
+
+
+def test_planner_fallback_uses_http_request_without_delegation():
+    class EmptyPlannerRouter:
+        def chat(self, provider: str, model: str, system: str, user: str, options: dict | None = None) -> str:
+            _ = provider, model, system, user, options
+            return "{}"
+
+    planner = ToolPlanner(
+        router=EmptyPlannerRouter(),
+        agent_cfg={
+            "llm": {"provider": "openai", "model": "admin-model", "options": {}},
+            "behavior": {"system_prompt": "You are admin."},
+        },
+        registry=TaskRegistry(),
+    )
+
+    plan = planner.plan(
+        owner_message="http_request GET to https://httpbin.org/get",
+        memory_context="",
+        allowed_agents=["codex", "software_dev"],
+    )
+
+    assert plan["task_type"] == "tool_acquisition"
+    assert plan["selected_agent"] == "none"
+    assert plan["requires_confirmation"] is False
+    assert plan["needs_supervisor"] is False
+    assert plan["tool_calls"] == [
+        {"tool": "http_request", "method": "GET", "url": "https://httpbin.org/get", "timeout": 30}
+    ]
+    assert all(call.get("tool") != "run_command" for call in plan["tool_calls"])
+
+
+def test_planner_manifest_advertises_http_request_and_blocks_run_command_http_usage():
+    class CaptureManifestRouter:
+        def __init__(self) -> None:
+            self.last_user = ""
+
+        def chat(self, provider: str, model: str, system: str, user: str, options: dict | None = None) -> str:
+            _ = provider, model, system, options
+            self.last_user = user
+            return "{}"
+
+    router = CaptureManifestRouter()
+    planner = ToolPlanner(
+        router=router,
+        agent_cfg={
+            "llm": {"provider": "openai", "model": "admin-model", "options": {}},
+            "behavior": {"system_prompt": "You are admin."},
+        },
+        registry=TaskRegistry(),
+    )
+
+    planner.plan(
+        owner_message="http_request GET to https://httpbin.org/get",
+        memory_context="",
+        allowed_agents=["codex", "software_dev"],
+    )
+
+    assert "Tool manifest:" in router.last_user
+    assert "http_request" in router.last_user
+    assert "This is the REQUIRED tool for all network/HTTP calls" in router.last_user
+    assert "method=GET|POST" in router.last_user
+    assert "url=HTTPS only" in router.last_user
+    assert "Do NOT use run_command with curl/wget/Invoke-WebRequest for HTTP" in router.last_user
+    assert "Network requests MUST use the http_request tool" in router.last_user
+
+
+def test_planner_normalizes_low_risk_http_wording():
+    class RiskyWordingRouter:
+        def chat(self, provider: str, model: str, system: str, user: str, options: dict | None = None) -> str:
+            _ = provider, model, system, user, options
+            return json.dumps(
+                {
+                    "status_update": "Supervisor approval is required for risky tool calls.",
+                    "task_type": "tool_acquisition",
+                    "selected_agent": "none",
+                    "delegate_prompt": "",
+                    "reply": "This requires approval.",
+                    "tool_calls": [{"tool": "http_request", "method": "GET", "url": "https://httpbin.org/get"}],
+                    "memory_updates": [],
+                    "needs_supervisor": True,
+                    "requires_user_input": False,
+                    "requires_confirmation": True,
+                    "rationale": "The http_request tool is risky and requires approval.",
+                }
+            )
+
+    planner = ToolPlanner(
+        router=RiskyWordingRouter(),
+        agent_cfg={
+            "llm": {"provider": "openai", "model": "admin-model", "options": {}},
+            "behavior": {"system_prompt": "You are admin."},
+        },
+        registry=TaskRegistry(),
+    )
+
+    plan = planner.plan(
+        owner_message="http_request GET to https://httpbin.org/get",
+        memory_context="",
+        allowed_agents=["codex", "software_dev"],
+    )
+
+    assert plan["requires_confirmation"] is False
+    assert plan["needs_supervisor"] is False
+    assert "approval" not in str(plan["status_update"]).lower()
+    assert "risky" not in str(plan["rationale"]).lower()
+
+
 def test_planner_fallback_avoids_user_text_derived_desktop_executable_paths():
     class EmptyPlannerRouter:
         def chat(self, provider: str, model: str, system: str, user: str, options: dict | None = None) -> str:
@@ -1962,6 +2115,362 @@ def test_tool_loop_stops_when_plan_returns_no_more_calls(tmp_path):
     # One tool execution round -> one re-plan call -> no more tool_calls -> stops
     assert len(all_results) >= 1, "Expected at least one tool result"
     assert (final_plan.get("tool_calls") or []) == [], "Final plan should have no remaining tool_calls"
+
+
+def test_direct_tool_failure_does_not_escalate_to_delegate(tmp_path: Path) -> None:
+    agents_dir = tmp_path / "agents"
+    agents_dir.mkdir(exist_ok=True)
+    _write_agent(agents_dir / "admin.yaml", "admin", "Admin", "admin-model")
+    _write_agent(agents_dir / "codex.yaml", "codex", "Codex", "worker-model")
+
+    orchestrator = AdminOrchestrator(
+        router=DummyRouter(),
+        workspace_root=tmp_path,
+        agents_dir=agents_dir,
+        state_dir=tmp_path / "state",
+        runs_dir=tmp_path / "runs",
+    )
+
+    assert orchestrator._should_delegate_tool_failure_repair("tool_acquisition") is False
+    assert orchestrator._should_delegate_tool_failure_repair("workspace_edit") is False
+    assert orchestrator._should_delegate_tool_failure_repair("code_support") is True
+
+
+def test_orchestrator_creates_numbered_text_files_directly_without_delegate(tmp_path: Path) -> None:
+    class EmptyPlannerRouter:
+        def chat(self, provider: str, model: str, system: str, user: str, options: dict | None = None) -> str:
+            _ = provider, system, options
+            if model == "admin-model" and "Reply with ONLY a JSON object" in user:
+                return "{}"
+            return "Final response synthesized for Telegram."
+
+    agents_dir = tmp_path / "agents"
+    agents_dir.mkdir(exist_ok=True)
+    _write_agent(agents_dir / "admin.yaml", "admin", "Admin", "admin-model")
+
+    orchestrator = AdminOrchestrator(
+        router=EmptyPlannerRouter(),
+        workspace_root=tmp_path,
+        agents_dir=agents_dir,
+        state_dir=tmp_path / "state",
+        runs_dir=tmp_path / "runs",
+    )
+
+    owner_message = "In the workspace, create 6 text files lead_01.txt...lead_06.txt"
+    plan = orchestrator._plan_request(
+        chat_id=42,
+        owner_message=owner_message,
+        route_task_type="workspace_edit",
+    )
+    final_plan, tool_results = orchestrator._run_tool_loop(
+        owner_message=owner_message,
+        initial_plan=plan,
+        chat_id=42,
+        route_task_type="workspace_edit",
+    )
+
+    assert final_plan["selected_agent"] == "none"
+    assert sum(1 for result in tool_results if result["tool"] == "write_file" and result["ok"]) == 6
+    for index in range(1, 7):
+        assert (tmp_path / f"lead_{index:02d}.txt").exists()
+
+
+def test_handle_message_numbered_text_file_request_needs_no_approval(tmp_path: Path) -> None:
+    class EmptyPlannerRouter:
+        def chat(self, provider: str, model: str, system: str, user: str, options: dict | None = None) -> str:
+            _ = provider, system, options
+            if model == "admin-model" and "Reply with ONLY a JSON object" in user:
+                return "{}"
+            return "Final response synthesized for Telegram."
+
+    agents_dir = tmp_path / "agents"
+    agents_dir.mkdir(exist_ok=True)
+    _write_agent(agents_dir / "admin.yaml", "admin", "Admin", "admin-model")
+
+    orchestrator = AdminOrchestrator(
+        router=EmptyPlannerRouter(),
+        workspace_root=tmp_path,
+        agents_dir=agents_dir,
+        state_dir=tmp_path / "state",
+        runs_dir=tmp_path / "runs",
+    )
+
+    messages = orchestrator.handle_message(
+        chat_id=42,
+        text="In the local-agent workspace: create 6 text files lead_01.txt...lead_06.txt",
+    )
+
+    assert not any("Approval required" in message for message in messages)
+    assert any(message == "Final response synthesized for Telegram." for message in messages)
+    for index in range(1, 7):
+        assert (tmp_path / f"lead_{index:02d}.txt").exists()
+
+
+def test_approval_execution_plan_preserves_direct_workspace_edit(tmp_path: Path) -> None:
+    agents_dir = tmp_path / "agents"
+    agents_dir.mkdir(exist_ok=True)
+    _write_agent(agents_dir / "admin.yaml", "admin", "Admin", "admin-model")
+    _write_agent(agents_dir / "codex.yaml", "codex", "Codex", "worker-model")
+
+    orchestrator = AdminOrchestrator(
+        router=DummyRouter(),
+        workspace_root=tmp_path,
+        agents_dir=agents_dir,
+        state_dir=tmp_path / "state",
+        runs_dir=tmp_path / "runs",
+    )
+
+    execution_plan = orchestrator._build_approval_execution_plan(
+        owner_message="In the local-agent workspace: create 6 text files lead_01.txt...lead_06.txt",
+        plan={
+            "task_type": "workspace_edit",
+            "selected_agent": "none",
+            "delegate_prompt": "",
+            "needs_supervisor": False,
+            "tool_calls": [
+                {"tool": "write_file", "path": "lead_01.txt", "content": ""},
+                {"tool": "write_file", "path": "lead_02.txt", "content": ""},
+            ],
+        },
+        include_tool_calls=True,
+    )
+
+    assert execution_plan["selected_agent"] == "none"
+    assert execution_plan["task_type"] == "workspace_edit"
+    assert len(execution_plan["tool_calls"]) == 2
+
+
+def test_approve_direct_workspace_edit_record_stays_local(tmp_path: Path) -> None:
+    agents_dir = tmp_path / "agents"
+    agents_dir.mkdir(exist_ok=True)
+    _write_agent(agents_dir / "admin.yaml", "admin", "Admin", "admin-model")
+    _write_agent(agents_dir / "codex.yaml", "codex", "Codex", "worker-model")
+
+    orchestrator = AdminOrchestrator(
+        router=DummyRouter(),
+        workspace_root=tmp_path,
+        agents_dir=agents_dir,
+        state_dir=tmp_path / "state",
+        runs_dir=tmp_path / "runs",
+    )
+
+    record = orchestrator.approvals.add_pending(
+        chat_id=123,
+        owner_message="In the local-agent workspace: create 6 text files lead_01.txt...lead_06.txt",
+        tool_calls=[
+            {"tool": "write_file", "path": "lead_01.txt", "content": ""},
+            {"tool": "write_file", "path": "lead_02.txt", "content": ""},
+        ],
+        rationale="Test direct workspace edit approval replay.",
+        workspace="local-agent",
+        execution_plan={
+            "selected_agent": "none",
+            "delegate_prompt": "",
+            "task_type": "workspace_edit",
+            "needs_supervisor": False,
+            "rationale": "Direct file creation",
+            "tool_calls": [
+                {"tool": "write_file", "path": "lead_01.txt", "content": ""},
+                {"tool": "write_file", "path": "lead_02.txt", "content": ""},
+            ],
+        },
+    )
+
+    messages = orchestrator.handle_message(chat_id=123, text=f"/approve {record['approval_id']}")
+
+    assert messages[0].startswith("Approved and executed")
+    assert not any("Delegate quality gate failed" in message for message in messages)
+    assert any("No delegate execution." in message for message in messages)
+    assert (tmp_path / "lead_01.txt").exists()
+    assert (tmp_path / "lead_02.txt").exists()
+
+
+def test_plain_file_create_route_has_no_confirmation_or_supervisor(tmp_path: Path) -> None:
+    """Creating plain text files must not require confirmation and must not invoke supervisor."""
+    registry = TaskRegistry()
+    route = registry.route_for("create 6 text files lead_01.txt...lead_06.txt in the workspace")
+    assert route.task_type == "workspace_edit"
+    assert route.requires_confirmation is False
+    assert route.requires_supervisor is False
+
+
+def test_explicit_source_edit_routes_to_code_support() -> None:
+    registry = TaskRegistry()
+    route = registry.route_for(
+        "edit src/local_agent/orchestration/tools.py and add a docstring to execute() explaining dispatch"
+    )
+    assert route.task_type == "code_support"
+    assert route.recommended_agent == "codex"
+    assert "replace_text" in route.allowed_tools
+    assert "write_file" in route.allowed_tools
+
+
+def test_destructive_workspace_edit_still_requires_confirmation() -> None:
+    registry = TaskRegistry()
+    route_delete = registry.route_for("delete the agents/old.yaml file from the workspace")
+    assert route_delete.requires_confirmation is True
+    route_rename = registry.route_for("rename agents/foo.yaml to agents/bar.yaml")
+    assert route_rename.requires_confirmation is True
+
+
+def test_supervisor_skipped_for_direct_tool_only_run(tmp_path: Path) -> None:
+    supervisor_called = []
+
+    class TrackingSupervisorRouter:
+        def chat(self, provider: str, model: str, system: str, user: str, options: dict | None = None) -> str:
+            _ = provider, system, options
+            if model == "supervisor-model":
+                supervisor_called.append(True)
+                return json.dumps({
+                    "summary": "Approved.", "risks": [], "corrections": [],
+                    "approve": True, "next_actions": [], "tool_feedback": "", "task_feedback": "",
+                })
+            if model == "admin-model" and "Reply with ONLY a JSON object" in user:
+                return "{}"
+            return "Final response synthesized for Telegram."
+
+    agents_dir = tmp_path / "agents"
+    agents_dir.mkdir(exist_ok=True)
+    _write_agent(agents_dir / "admin.yaml", "admin", "Admin", "admin-model")
+    _write_agent(agents_dir / "supervisor.yaml", "supervisor", "Supervisor", "supervisor-model", provider="anthropic")
+
+    orchestrator = AdminOrchestrator(
+        router=TrackingSupervisorRouter(),
+        workspace_root=tmp_path,
+        agents_dir=agents_dir,
+        state_dir=tmp_path / "state",
+        runs_dir=tmp_path / "runs",
+    )
+
+    orchestrator.handle_message(
+        chat_id=42,
+        text="In the workspace, create 6 text files lead_01.txt...lead_06.txt",
+    )
+
+    assert supervisor_called == [], "Supervisor must not be called for a direct write-file-only run"
+    for index in range(1, 7):
+        assert (tmp_path / f"lead_{index:02d}.txt").exists()
+
+
+def test_supervisor_list_string_does_not_split_to_chars() -> None:
+    from local_agent.orchestration.supervisor import ToolSupervisor
+
+    class StringListRouter:
+        def chat(self, provider, model, system, user, options=None):
+            return json.dumps({
+                "summary": "Approved.",
+                "risks": "1) File created cleanly.",
+                "corrections": "1) CONFIRMED: direct write_file is correct.",
+                "approve": True,
+                "next_actions": "1) Owner can proceed.",
+                "tool_feedback": "",
+                "task_feedback": "",
+            })
+
+    supervisor = ToolSupervisor(
+        router=StringListRouter(),
+        agent_cfg={"llm": {"provider": "test", "model": "m", "options": {}}, "behavior": {"system_prompt": "s"}},
+    )
+    record, digest = supervisor.review(
+        owner_message="create a file",
+        plan={"task_type": "workspace_edit"},
+        tool_results=[],
+        delegate_output="",
+        memory_context="",
+    )
+
+    assert isinstance(record["risks"], list)
+    assert len(record["risks"]) == 1
+    assert "File created" in record["risks"][0]
+    assert "### Risks\n- 1" in digest
+    assert "### Corrections\n- 1" in digest
+    assert "### Next Actions\n- 1" in digest
+
+
+def test_orchestrator_http_request_direct_execution_stays_local(tmp_path: Path, monkeypatch) -> None:
+    class EmptyPlannerRouter:
+        def chat(self, provider: str, model: str, system: str, user: str, options: dict | None = None) -> str:
+            _ = provider, system, options
+            if model == "admin-model" and "Reply with ONLY a JSON object" in user:
+                return "{}"
+            return "Final response synthesized for Telegram."
+
+    class _FakeResponse:
+        status = 200
+
+        def getcode(self):
+            return 200
+
+        def read(self):
+            return b'{"ok": true}'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setenv("HTTP_TOOL_ALLOWLIST", "httpbin.org")
+    monkeypatch.setattr("urllib.request.urlopen", lambda request, timeout=30, context=None: _FakeResponse())
+
+    agents_dir = tmp_path / "agents"
+    agents_dir.mkdir(exist_ok=True)
+    _write_agent(agents_dir / "admin.yaml", "admin", "Admin", "admin-model")
+
+    orchestrator = AdminOrchestrator(
+        router=EmptyPlannerRouter(),
+        workspace_root=tmp_path,
+        agents_dir=agents_dir,
+        state_dir=tmp_path / "state",
+        runs_dir=tmp_path / "runs",
+    )
+
+    plan = orchestrator._plan_request(
+        chat_id=42,
+        owner_message="http_request GET to https://httpbin.org/get",
+        route_task_type="tool_acquisition",
+    )
+    final_plan, tool_results = orchestrator._run_tool_loop(
+        owner_message="http_request GET to https://httpbin.org/get",
+        initial_plan=plan,
+        chat_id=42,
+        route_task_type="tool_acquisition",
+    )
+
+    assert final_plan["selected_agent"] == "none"
+    assert any(result["tool"] == "http_request" and result["ok"] for result in tool_results)
+    payload = json.loads(next(result["output"] for result in tool_results if result["tool"] == "http_request"))
+    assert payload["status"] == 200
+
+
+def test_planner_replan_skips_duplicate_http_request_after_success():
+    class EmptyPlannerRouter:
+        def chat(self, provider: str, model: str, system: str, user: str, options: dict | None = None) -> str:
+            _ = provider, model, system, user, options
+            return "{}"
+
+    planner = ToolPlanner(
+        router=EmptyPlannerRouter(),
+        agent_cfg={
+            "llm": {"provider": "openai", "model": "admin-model", "options": {}},
+            "behavior": {"system_prompt": "You are admin."},
+        },
+        registry=TaskRegistry(),
+    )
+
+    plan = planner.plan(
+        owner_message=(
+            "http_request GET to https://httpbin.org/get\n\n"
+            "--- Tool results (iteration 1) ---\n"
+            "[ok] http_request: {\"ok\": true, \"status\": 200}"
+        ),
+        memory_context="",
+        allowed_agents=["codex", "software_dev"],
+    )
+
+    assert plan["task_type"] == "tool_acquisition"
+    assert plan["tool_calls"] == []
+    assert plan["requires_confirmation"] is False
 
 
 def test_infer_execution_recovery_calls_for_alibre_launch(tmp_path: Path):

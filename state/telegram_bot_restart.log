@@ -1,0 +1,2 @@
+[FAULT-INJECT] CHAD_FORCE_PARSE_FAILURE=1 forcing planner parse failure
+Planner returned malformed JSON: <fault-injected malformed output>

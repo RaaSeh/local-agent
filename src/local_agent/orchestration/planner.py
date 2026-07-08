@@ -63,6 +63,70 @@ def _infer_known_packages(owner_message: str) -> list[str]:
     return found[:3]
 
 
+def _extract_completed_write_targets(owner_message: str) -> set[str]:
+    completed: set[str] = set()
+    for raw_path in re.findall(r"Wrote\s+([^\r\n]+)", owner_message or "", flags=re.IGNORECASE):
+        name = Path(raw_path.strip()).name.strip()
+        if name:
+            completed.add(name.lower())
+    return completed
+
+
+def _infer_numbered_file_write_calls(owner_message: str) -> list[dict]:
+    text = owner_message or ""
+    lowered = text.lower()
+    if not any(token in lowered for token in ("create", "make", "add", "build", "write")):
+        return []
+
+    range_match = re.search(
+        r"\b([A-Za-z0-9_-]*?)(\d+)\.(txt|md|json|yaml|yml|csv)\s*(?:\.\.\.?|…|through|thru|to|-)\s*([A-Za-z0-9_-]*?)(\d+)\.(txt|md|json|yaml|yml|csv)\b",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if not range_match:
+        return []
+
+    start_prefix, start_num, start_ext, end_prefix, end_num, end_ext = range_match.groups()
+    resolved_end_prefix = end_prefix or start_prefix
+    if resolved_end_prefix.lower() != start_prefix.lower() or end_ext.lower() != start_ext.lower():
+        return []
+
+    start_value = int(start_num)
+    end_value = int(end_num)
+    if end_value < start_value:
+        return []
+
+    width = max(len(start_num), len(end_num))
+    completed = _extract_completed_write_targets(text)
+    calls: list[dict] = []
+    for value in range(start_value, end_value + 1):
+        filename = f"{start_prefix}{value:0{width}d}.{start_ext.lower()}"
+        if filename.lower() in completed:
+            continue
+        calls.append({"tool": "write_file", "path": filename, "content": ""})
+    return calls[:5]
+
+
+def _infer_http_request_call(owner_message: str) -> dict | None:
+    text = (owner_message or "").strip()
+    lowered = text.lower()
+    url_match = re.search(r"https://[^\s)\]>'\"]+", text)
+    if not url_match:
+        return None
+
+    method_match = re.search(r"\b(get|post)\b", lowered)
+    if "http_request" not in lowered and not method_match:
+        return None
+
+    method = method_match.group(1).upper() if method_match else "GET"
+    return {
+        "tool": "http_request",
+        "method": method,
+        "url": url_match.group(0),
+        "timeout": 30,
+    }
+
+
 @dataclass
 class ToolPlanner:
     router: object
@@ -106,6 +170,8 @@ class ToolPlanner:
             "- If the request is best served by direct tools, keep selected_agent as none and add concrete tool_calls.\n"
             "- For desktop_execution, environment, tool_acquisition, and workspace_edit tasks, prefer selected_agent=none with direct tool_calls unless the tool manifest cannot satisfy the request.\n"
             "- For workspace_inspection tasks, selected_agent must be none, delegate_prompt must be empty, and tool_calls must contain direct list_files/read_file/search_text calls.\n"
+            "- Make all network/HTTP/API calls with http_request. This is required whenever external URLs are involved.\n"
+            "- Do NOT use run_command with curl/wget/Invoke-WebRequest for HTTP; run_command is only for local shell/file operations.\n"
             "- If a required capability may be missing, prefer check_capability first and then install/scaffold/download the missing capability in the same plan when the target is clear.\n"
             "- If the request needs a specialist worker, choose exactly one selected_agent and keep tool_calls empty unless the tools are strictly necessary.\n"
             "- For delegated coding/CAD tasks, delegate_prompt must be concrete and implementation-ready (specific deliverables, file or module targets, and acceptance checks).\n"
@@ -228,13 +294,38 @@ class ToolPlanner:
 
         if self._requires_verification_first_route(parsed["task_type"]) and not self._is_replan_context(owner_message):
             if not self._starts_with_verification_tool(parsed["tool_calls"]):
-                parsed["tool_calls"] = self._verification_first_tool_calls(
-                    owner_message=owner_message,
-                    task_type=str(parsed["task_type"]),
-                )
+                if not self._should_skip_verification_first(owner_message, str(parsed["task_type"])):
+                    parsed["tool_calls"] = self._verification_first_tool_calls(
+                        owner_message=owner_message,
+                        task_type=str(parsed["task_type"]),
+                    )
 
         if self.registry.confirmation_required(parsed["task_type"], parsed["tool_calls"]):
             parsed["requires_confirmation"] = True
+
+        if self._is_low_risk_http_plan(parsed):
+            parsed["requires_confirmation"] = False
+            parsed["needs_supervisor"] = False
+            rationale = str(parsed.get("rationale", "")).strip().lower()
+            if "approval" in rationale or "risky" in rationale or "supervisor" in rationale:
+                parsed["rationale"] = (
+                    "Direct low-risk HTTP GET to allowlisted host via http_request; no approval, delegation, or supervisor review required."
+                )
+            for key in ("status_update", "reply"):
+                text = str(parsed.get(key, "")).strip()
+                if text and any(token in text.lower() for token in ("supervisor approval", "requires approval", "risky tool")):
+                    parsed[key] = "Executing direct low-risk HTTP GET request."
+
+        if (
+            parsed.get("task_type") == "tool_acquisition"
+            and self._is_replan_context(owner_message)
+            and "[ok] http_request" in (owner_message or "").lower()
+            and all(str((call or {}).get("tool", "")).strip().lower() == "http_request" for call in (parsed.get("tool_calls") or []))
+        ):
+            # The HTTP request already succeeded in a previous iteration; avoid duplicate identical calls.
+            parsed["tool_calls"] = []
+            parsed["requires_confirmation"] = False
+            parsed["reply"] = str(parsed.get("reply") or "HTTP request already completed successfully.")
 
         parsed = self._normalize_delegate_contract(
             parsed=parsed,
@@ -251,6 +342,16 @@ class ToolPlanner:
 
         if task_type == "workspace_inspection":
             return self._infer_workspace_inspection_tool_calls(owner_message)
+
+        if task_type == "workspace_edit":
+            file_create_calls = _infer_numbered_file_write_calls(owner_message)
+            if file_create_calls:
+                return file_create_calls
+
+        if task_type == "tool_acquisition":
+            http_call = _infer_http_request_call(owner_message)
+            if http_call:
+                return [http_call]
 
         if task_type == "desktop_execution" and "alibre" in lowered:
             calls.append(
@@ -397,6 +498,29 @@ class ToolPlanner:
             )
         )
 
+    @staticmethod
+    def _should_skip_verification_first(owner_message: str, task_type: str) -> bool:
+        normalized = str(task_type or "").strip().lower()
+        if normalized == "tool_acquisition" and _infer_http_request_call(owner_message):
+            return True
+        if normalized == "workspace_edit" and _infer_numbered_file_write_calls(owner_message):
+            return True
+        return False
+
+    @staticmethod
+    def _is_low_risk_http_plan(parsed: dict) -> bool:
+        if str(parsed.get("task_type", "")).strip().lower() != "tool_acquisition":
+            return False
+        calls = parsed.get("tool_calls") or []
+        if not isinstance(calls, list) or not calls:
+            return False
+        for call in calls:
+            if not isinstance(call, dict):
+                return False
+            if str(call.get("tool", "")).strip().lower() != "http_request":
+                return False
+        return not TaskRegistry().confirmation_required("tool_acquisition", calls)
+
     def _verification_first_tool_calls(self, owner_message: str, task_type: str) -> list[dict]:
         calls: list[dict] = [{"tool": "list_files", "path": ".", "limit": 120}]
         lowered = (owner_message or "").lower()
@@ -419,6 +543,35 @@ class ToolPlanner:
         delegate_prompt = str(parsed.get("delegate_prompt", "")).strip()
         if not delegate_prompt or selected_agent not in {"", "none", "admin"}:
             return parsed
+
+        task_type = str(parsed.get("task_type", "")).strip().lower()
+        if task_type in {
+            "workspace_edit",
+            "tool_acquisition",
+            "environment",
+            "desktop_execution",
+            "document_export",
+            "workspace_inspection",
+            "inspection",
+            "general",
+        }:
+            direct_calls = parsed.get("tool_calls") or self._infer_fallback_tool_calls(
+                owner_message=owner_message,
+                task_type=task_type,
+            )
+            if direct_calls:
+                logger.warning(
+                    "Planner emitted delegate_prompt for direct-tool task_type=%s with selected_agent=none; clearing delegate_prompt",
+                    task_type,
+                )
+                if not parsed.get("tool_calls"):
+                    parsed["tool_calls"] = self.registry.filter_tool_calls(
+                        parsed["task_type"],
+                        direct_calls,
+                        trusted=False,
+                    )
+                parsed["delegate_prompt"] = ""
+                return parsed
 
         if self._has_mutating_tool_calls(parsed.get("tool_calls") or []):
             logger.warning(

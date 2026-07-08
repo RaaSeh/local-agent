@@ -3,16 +3,22 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import ssl
 import subprocess
 import sys
 import time
 import urllib.request
+from urllib.parse import urlparse
 from pathlib import Path
 
 
+_DEFAULT_HTTP_ALLOWLIST = {"httpbin.org"}
+
+
 class ToolExecutor:
-    def __init__(self, workspace_root: str | Path = "."):
+    def __init__(self, workspace_root: str | Path = ".", max_tool_calls: int = 5):
         self.workspace_root = Path(workspace_root).resolve()
+        self.max_tool_calls = self._safe_int(max_tool_calls, default=5, minimum=1, maximum=20)
 
     @staticmethod
     def _safe_int(raw_value, default: int, minimum: int | None = None, maximum: int | None = None) -> int:
@@ -27,8 +33,22 @@ class ToolExecutor:
         return value
 
     def execute(self, tool_calls: list[dict] | None) -> list[dict]:
+        """Execute tool calls by dispatching each call to `_tool_<name>` handlers.
+
+        For each normalized call, the method resolves the handler dynamically with
+        `getattr(self, f"_tool_{tool_name}", None)`. Missing handlers are reported
+        as `Unsupported tool` for that call. Handler failures are caught per call and
+        converted into `{ok: False, output: <error>}` results so one bad call does
+        not stop remaining calls.
+
+        Args:
+            tool_calls: Tool call dictionaries, each expected to include a `tool` name.
+
+        Returns:
+            A result dictionary per attempted call with `tool`, `ok`, and `output`.
+        """
         results: list[dict] = []
-        for call in (tool_calls or [])[:5]:
+        for call in (tool_calls or [])[: self.max_tool_calls]:
             call = self._normalize_call(call)
             tool_name = str(call.get("tool", "")).strip().lower()
             if not tool_name:
@@ -393,6 +413,80 @@ class ToolExecutor:
         urllib.request.urlretrieve(url, dest)  # noqa: S310 — HTTPS-only guard above
         size = dest.stat().st_size
         return f"Downloaded {url} → {dest} ({size} bytes)"
+
+    def _tool_http_request(self, call: dict) -> str:
+        """Execute a constrained outbound HTTPS API request (GET/POST only)."""
+        method = str(call.get("method", "GET")).strip().upper()
+        if method not in {"GET", "POST"}:
+            raise ValueError("http_request only supports GET or POST")
+
+        url = str(call.get("url", "")).strip()
+        if not url:
+            raise ValueError("http_request requires 'url'")
+        if not url.lower().startswith("https://"):
+            raise ValueError("http_request only allows HTTPS URLs")
+
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").strip().lower()
+        if not host:
+            raise ValueError("http_request requires a valid URL host")
+
+        raw_allowlist = os.getenv("HTTP_TOOL_ALLOWLIST", "")
+        allowlist = {
+            item.strip().lower()
+            for item in raw_allowlist.split(",")
+            if item.strip()
+        }
+        if method == "GET":
+            allowlist |= _DEFAULT_HTTP_ALLOWLIST
+        if host not in allowlist:
+            raise ValueError(f"http_request host not allowlisted: {host}")
+
+        timeout = self._safe_int(call.get("timeout", 30), default=30, minimum=1, maximum=120)
+        raw_headers = call.get("headers")
+        headers = {str(key): str(value) for key, value in raw_headers.items()} if isinstance(raw_headers, dict) else {}
+
+        json_body = call.get("json_body")
+        body_bytes: bytes | None = None
+        if json_body is not None:
+            if not isinstance(json_body, dict):
+                raise ValueError("http_request json_body must be an object")
+            body_bytes = json.dumps(json_body).encode("utf-8")
+            headers.setdefault("Content-Type", "application/json")
+
+        request = urllib.request.Request(url=url, data=body_bytes, headers=headers, method=method)
+        ssl_context = None
+        try:
+            import certifi  # type: ignore
+
+            ssl_context = ssl.create_default_context(cafile=certifi.where())
+        except Exception:
+            ssl_context = ssl.create_default_context()
+
+        with urllib.request.urlopen(request, timeout=timeout, context=ssl_context) as response:  # noqa: S310
+            status = int(getattr(response, "status", None) or response.getcode() or 0)
+            raw_payload = response.read()
+
+        decoded = raw_payload.decode("utf-8", errors="replace")
+        parsed_payload: object
+        try:
+            parsed_payload = json.loads(decoded)
+        except json.JSONDecodeError:
+            parsed_payload = decoded
+
+        if isinstance(parsed_payload, str):
+            compact_payload: object = parsed_payload[:2000]
+        else:
+            compact_payload = parsed_payload
+
+        return json.dumps(
+            {
+                "ok": True,
+                "status": status,
+                "json_or_text_truncated": compact_payload,
+            },
+            ensure_ascii=True,
+        )
 
     def _tool_run_command(self, call: dict) -> str:
         command = str(call.get("command", "")).strip()

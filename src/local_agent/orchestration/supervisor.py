@@ -85,58 +85,89 @@ class ToolSupervisor:
             user=user,
             options=resolved["options"],
         )
+
+        def _parse_or_raise(payload: str) -> dict:
+            parsed_payload = _parse_json(payload)
+            parsed_payload.setdefault("summary", payload.strip())
+            parsed_payload.setdefault("risks", [])
+            parsed_payload.setdefault("corrections", [])
+            parsed_payload.setdefault("approve", False)
+            parsed_payload.setdefault("next_actions", [])
+            parsed_payload.setdefault("tool_feedback", "")
+            parsed_payload.setdefault("task_feedback", "")
+            return parsed_payload
+
         try:
-            parsed = _parse_json(raw)
+            parsed = _parse_or_raise(raw)
         except PlanParseError as exc:
-            summary = f"Run blocked: supervisor output could not be parsed. Raw snippet: {exc.preview()}"
-            return (
-                {
-                    "summary": summary,
-                    "risks": ["Malformed supervisor JSON output."],
-                    "corrections": ["Re-run the supervisor review with valid JSON output."],
-                    "approve": False,
-                    "next_actions": [],
-                    "tool_feedback": "",
-                    "task_feedback": "",
-                    "status": "blocked",
-                    "parse_error": True,
-                    "parse_error_source": exc.source,
-                    "parse_error_raw": exc.raw,
-                    "parse_error_snippet": exc.preview(),
-                },
-                "\n".join(
-                    [
-                        "## Supervisor Review",
-                        summary,
-                        "",
-                        "### Risks",
-                        "- Malformed supervisor JSON output.",
-                    ]
-                ),
+            repair_user = (
+                "Your previous response could not be parsed as JSON.\n"
+                "Return ONLY a valid JSON object with exactly these keys:\n"
+                "summary, risks, corrections, approve, next_actions, tool_feedback, task_feedback\n\n"
+                f"Malformed output snippet:\n{exc.preview()}\n"
             )
-        parsed.setdefault("summary", raw.strip())
-        parsed.setdefault("risks", [])
-        parsed.setdefault("corrections", [])
-        parsed.setdefault("approve", False)
-        parsed.setdefault("next_actions", [])
-        parsed.setdefault("tool_feedback", "")
-        parsed.setdefault("task_feedback", "")
+            repair_raw = self.router.chat(
+                provider=resolved["provider"],
+                model=resolved["model"],
+                system=system,
+                user=repair_user,
+                options=resolved["options"],
+            )
+            try:
+                parsed = _parse_or_raise(repair_raw)
+            except PlanParseError:
+                summary = f"Run blocked: supervisor output could not be parsed. Raw snippet: {exc.preview()}"
+                return (
+                    {
+                        "summary": summary,
+                        "risks": ["Malformed supervisor JSON output."],
+                        "corrections": ["Re-run the supervisor review with valid JSON output."],
+                        "approve": False,
+                        "next_actions": [],
+                        "tool_feedback": "",
+                        "task_feedback": "",
+                        "status": "blocked",
+                        "parse_error": True,
+                        "parse_error_source": exc.source,
+                        "parse_error_raw": exc.raw,
+                        "parse_error_snippet": exc.preview(),
+                    },
+                    "\n".join(
+                        [
+                            "## Supervisor Review",
+                            summary,
+                            "",
+                            "### Risks",
+                            "- Malformed supervisor JSON output.",
+                        ]
+                    ),
+                )
+
+        def _to_list(value: object) -> list:
+            if isinstance(value, list):
+                return value
+            if isinstance(value, str) and value.strip():
+                return [value.strip()]
+            return []
 
         digest_lines = [
             "## Supervisor Review",
             str(parsed.get("summary", "")).strip(),
         ]
-        risks = parsed.get("risks") or []
+        risks = _to_list(parsed.get("risks"))
+        parsed["risks"] = risks
         if risks:
             digest_lines.append("\n### Risks")
             for item in risks[:5]:
                 digest_lines.append(f"- {item}")
-        corrections = parsed.get("corrections") or []
+        corrections = _to_list(parsed.get("corrections"))
+        parsed["corrections"] = corrections
         if corrections:
             digest_lines.append("\n### Corrections")
             for item in corrections[:5]:
                 digest_lines.append(f"- {item}")
-        next_actions = parsed.get("next_actions") or []
+        next_actions = _to_list(parsed.get("next_actions"))
+        parsed["next_actions"] = next_actions
         if next_actions:
             digest_lines.append("\n### Next Actions")
             for item in next_actions[:5]:

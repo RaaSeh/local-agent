@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import yaml
+
+
+_DEFAULT_HTTP_ALLOWLIST = {"httpbin.org"}
 
 
 def _utc_now() -> str:
@@ -27,6 +32,8 @@ class PolicyEngine:
         "delete_file",
         "rename_path",
     }
+
+    _SAFE_RENAME_EXTENSIONS = {".txt", ".md", ".rst", ".log", ".csv"}
 
     _DELETE_APPROVAL_CUTOFF = datetime(2026, 6, 1, tzinfo=timezone.utc)
     _DANGEROUS_COMMAND_TOKENS = (
@@ -79,6 +86,12 @@ class PolicyEngine:
             return PolicyDecision(False, "Deletion target is recent; no approval required.", "safe_internal_action")
 
         if tool_name in {"rename_path"}:
+            if self._is_low_risk_rename(tool_call):
+                return PolicyDecision(
+                    False,
+                    "Plain text file rename is auto-allowed.",
+                    "safe_internal_action",
+                )
             return PolicyDecision(True, "Path rename/move is workflow-changing and requires approval.", "workflow_change")
 
         if tool_name == "run_command":
@@ -90,6 +103,34 @@ class PolicyEngine:
                     "destructive_action",
                 )
             return PolicyDecision(False, "Non-destructive local command is auto-allowed.", "safe_internal_action")
+
+        if tool_name == "http_request":
+            target_url = str(tool_call.get("url", "")).strip()
+            target_host = (urlparse(target_url).hostname or "").strip().lower()
+            method = str(tool_call.get("method", "GET")).strip().upper()
+            allowlist_raw = os.getenv("HTTP_TOOL_ALLOWLIST", "")
+            allowlist = {item.strip().lower() for item in allowlist_raw.split(",") if item.strip()}
+            if method == "GET":
+                allowlist |= _DEFAULT_HTTP_ALLOWLIST
+            paid_hosts_raw = os.getenv("HTTP_TOOL_PAID_HOSTS", "apps.emaillistverified.com")
+            paid_hosts = {item.strip().lower() for item in paid_hosts_raw.split(",") if item.strip()}
+            if target_host and target_host in paid_hosts:
+                return PolicyDecision(
+                    True,
+                    "External HTTP request to a paid API requires approval.",
+                    "spend_money",
+                )
+            if method == "GET" and target_host and target_host in allowlist:
+                return PolicyDecision(
+                    False,
+                    "Allowlisted HTTPS GET request is auto-allowed.",
+                    "safe_internal_action",
+                )
+            return PolicyDecision(
+                True,
+                "External HTTP request requires approval.",
+                "external_action",
+            )
 
         if tool_name in {
             "launch_executable",
@@ -127,6 +168,23 @@ class PolicyEngine:
         except OSError:
             return True
         return mtime < self._DELETE_APPROVAL_CUTOFF
+
+    def _is_low_risk_rename(self, tool_call: dict[str, Any]) -> bool:
+        source_raw = str(tool_call.get("path", "") or tool_call.get("source", "")).strip()
+        target_raw = str(tool_call.get("target", "") or tool_call.get("new_path", "")).strip()
+        if not source_raw or not target_raw:
+            return False
+
+        source = Path(source_raw)
+        target = Path(target_raw)
+        if source.suffix.lower() not in self._SAFE_RENAME_EXTENSIONS:
+            return False
+        if target.suffix.lower() not in self._SAFE_RENAME_EXTENSIONS:
+            return False
+
+        source_parent = str(source.parent).replace("\\", "/")
+        target_parent = str(target.parent).replace("\\", "/")
+        return source_parent == target_parent
 
     def classify_owner_request(self, owner_message: str) -> PolicyDecision:
         text = (owner_message or "").strip().lower()
